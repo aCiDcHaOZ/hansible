@@ -1,37 +1,254 @@
 ---
-- name: Maak 1 Proxmox container aan op basis van klantnummer
-  hosts: proxmox
-  become: yes
+- name: Maak WordPress CT aan op Proxmox
+  hosts: localhost
+  gather_facts: false
+
+  collections:
+    - community.proxmox
+
+  vars_prompt:
+    - name: klantnummer
+      prompt: "Geef het klantnummer op"
+      private: false
+
+    - name: ssh_public_key
+      prompt: "Plak de SSH public key voor de nieuwe gebruiker"
+      private: false
 
   vars:
-    ct_hostname: "klant-{{ klantnummer }}"
+    proxmox_api_host: "10.24.43.2"
+    proxmox_api_port: 8006
+    proxmox_node: "linda"
+
+    # Als api_secret in het formaat user@realm!tokenid=secret staat,
+    # wordt token-auth gebruikt. Anders valt het playbook terug op root@pam + wachtwoord.
+    api_secret_file: "{{ playbook_dir }}/api_secret"
+
+    proxmox_fallback_user: "root@pam"
+    proxmox_fallback_password: "pindakaas"
+
+    ct_hostname: "wordpress_{{ klantnummer }}"
+    ct_memory_mb: 512
+    ct_cores: 1
+    ct_bridge: "vmbr0"
+    ct_disk_gb: 10
+    ct_rootfs_storage: "local"
+    ct_template: "local:vztemp1/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+
+    # Nodig voor de community.proxmox modules bij self-signed certs
+    proxmox_validate_certs: false
 
   tasks:
-    - name: Controleer of klantnummer is opgegeven
-      ansible.builtin.fail:
-        msg: "Geef een klantnummer op met -e 'klantnummer=12345'"
-      when: klantnummer is not defined
+    - name: Lees api_secret bestand
+      ansible.builtin.slurp:
+        src: "{{ api_secret_file }}"
+      register: api_secret_raw
 
-    - name: Toon hostname
-      ansible.builtin.debug:
-        msg: "De container hostname wordt {{ ct_hostname }}"
+    - name: Zet api_secret om naar string
+      ansible.builtin.set_fact:
+        api_secret_string: "{{ api_secret_raw.content | b64decode | trim }}"
 
-    - name: Maak container aan
-      community.general.proxmox:
+    - name: Bepaal of api_secret een volledig Proxmox API token is
+      ansible.builtin.set_fact:
+        use_api_token: "{{ api_secret_string is match('^[^!]+![^=]+=.+$') }}"
+
+    - name: Stel auth-variabelen in
+      ansible.builtin.set_fact:
+        proxmox_api_user: >-
+          {{
+            (api_secret_string | regex_replace('^([^!]+)![^=]+=.+$', '\\1'))
+            if use_api_token else proxmox_fallback_user
+          }}
+        proxmox_api_token_id: >-
+          {{
+            (api_secret_string | regex_replace('^[^!]+!([^=]+)=.+$', '\\1'))
+            if use_api_token else omit
+          }}
+        proxmox_api_token_secret: >-
+          {{
+            (api_secret_string | regex_replace('^[^!]+![^=]+=(.+)$', '\\1'))
+            if use_api_token else omit
+          }}
+        proxmox_api_password: "{{ omit if use_api_token else proxmox_fallback_password }}"
+
+    - name: Maak de CT aan
+      community.proxmox.proxmox:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
         api_user: "{{ proxmox_api_user }}"
         api_password: "{{ proxmox_api_password }}"
-        api_host: "{{ proxmox_api_host }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+
         node: "{{ proxmox_node }}"
-        hostname: "{{ ct_hostname }}"
-        vmid: "{{ klantnummer }}"
-        password: "{{ ct_root_password }}"
-        ostemplate: "local:vztmpl/debian-12-standard_12.0-1_amd64.tar.zst"
-        storage: "local-lvm"
-        disk: "8"
-        memory: "1024"
-        cores: "1"
-        netif: '{"net0":"name=eth0,bridge=vmbr0,ip=dhcp"}'
         state: present
-      delegate_to: localhost
-        group: root
-        mode: "0440"
+
+        hostname: "{{ ct_hostname }}"
+        ostemplate: "{{ ct_template }}"
+        password: "{{ proxmox_fallback_password }}"
+
+        memory: "{{ ct_memory_mb }}"
+        cores: "{{ ct_cores }}"
+
+        disk_volume:
+          storage: "{{ ct_rootfs_storage }}"
+          size: "{{ ct_disk_gb }}"
+
+        netif:
+          net0: "name=eth0,ip=dhcp,ip6=dhcp,bridge={{ ct_bridge }},firewall=1"
+
+        onboot: true
+        start: true
+      register: ct_create
+
+    - name: Zoek CT-info op basis van hostname
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        type: lxc
+        name: "{{ ct_hostname }}"
+      register: ct_info
+
+    - name: Valideer dat precies één CT gevonden is
+      ansible.builtin.assert:
+        that:
+          - ct_info.proxmox_vms | length == 1
+        fail_msg: "Kon de CT {{ ct_hostname }} niet eenduidig terugvinden in Proxmox."
+
+    - name: Sla vmid op
+      ansible.builtin.set_fact:
+        ct_vmid: "{{ ct_info.proxmox_vms[0].vmid }}"
+
+    - name: Zet firewall-opties op VM/CT-niveau
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ ct_vmid }}/firewall/options"
+        method: PUT
+        validate_certs: false
+        force_basic_auth: true
+        user: "{{ proxmox_fallback_user }}"
+        password: "{{ proxmox_fallback_password }}"
+        body_format: form-urlencoded
+        body:
+          enable: 1
+          policy_in: DROP
+          policy_out: ACCEPT
+      register: firewall_options_result
+
+    - name: Voeg inbound firewall rules toe voor 22, 80 en 443
+      community.proxmox.proxmox_firewall:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+
+        level: vm
+        node: "{{ proxmox_node }}"
+        vmid: "{{ ct_vmid }}"
+        state: present
+        update: true
+        rules:
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "22"
+            pos: 0
+            enable: true
+            comment: "Allow SSH"
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "80"
+            pos: 1
+            enable: true
+            comment: "Allow HTTP"
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "443"
+            pos: 2
+            enable: true
+            comment: "Allow HTTPS"
+
+    - name: Voeg Proxmox host toe aan tijdelijke inventory
+      ansible.builtin.add_host:
+        name: proxmox_linda
+        ansible_host: "{{ proxmox_api_host }}"
+        ansible_user: root
+        ansible_password: "{{ proxmox_fallback_password }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+        ct_vmid: "{{ ct_vmid }}"
+        klantnummer: "{{ klantnummer }}"
+        ssh_public_key: "{{ ssh_public_key }}"
+
+- name: Maak gebruiker aan in de container
+  hosts: proxmox_linda
+  gather_facts: false
+
+  tasks:
+    - name: Wacht tot de container draait
+      ansible.builtin.shell: "pct status {{ ct_vmid }} | awk '{print $2}'"
+      register: ct_status
+      retries: 20
+      delay: 3
+      until: ct_status.stdout == "running"
+      changed_when: false
+
+    - name: Installeer sudo indien nodig
+      ansible.builtin.shell: "pct exec {{ ct_vmid }} -- bash -lc 'apt-get update && apt-get install -y sudo'"
+      register: sudo_install
+      changed_when: "'0 upgraded, 0 newly installed' not in sudo_install.stdout"
+      failed_when: sudo_install.rc != 0
+
+    - name: Maak gebruiker aan
+      ansible.builtin.shell: >
+        pct exec {{ ct_vmid }} -- bash -lc
+        "id -u '{{ klantnummer }}' >/dev/null 2>&1 ||
+         useradd -m -s /bin/bash '{{ klantnummer }}'"
+      changed_when: false
+
+    - name: Voeg gebruiker toe aan sudo group
+      ansible.builtin.shell: >
+        pct exec {{ ct_vmid }} -- bash -lc
+        "usermod -aG sudo '{{ klantnummer }}'"
+      changed_when: false
+
+    - name: Geef passwordless sudo
+      ansible.builtin.shell: >
+        pct exec {{ ct_vmid }} -- bash -lc
+        "printf '%s ALL=(ALL) NOPASSWD:ALL\n' '{{ klantnummer }}' > /etc/sudoers.d/{{ klantnummer }} &&
+         chmod 0440 /etc/sudoers.d/{{ klantnummer }}"
+      changed_when: false
+
+    - name: Maak .ssh map aan
+      ansible.builtin.shell: >
+        pct exec {{ ct_vmid }} -- bash -lc
+        "install -d -m 700 -o '{{ klantnummer }}' -g '{{ klantnummer }}'
+         /home/{{ klantnummer }}/.ssh"
+      changed_when: false
+
+    - name: Plaats authorized_keys
+      ansible.builtin.shell: >
+        pct exec {{ ct_vmid }} -- bash -lc
+        "cat > /home/{{ klantnummer }}/.ssh/authorized_keys <<'EOF'
+        {{ ssh_public_key }}
+        EOF
+        chown {{ klantnummer }}:{{ klantnummer }} /home/{{ klantnummer }}/.ssh/authorized_keys &&
+        chmod 600 /home/{{ klantnummer }}/.ssh/authorized_keys"
+      changed_when: false
+
+    - name: Toon resultaat
+      ansible.builtin.debug:
+        msg:
+          - "CT aangemaakt: wordpress_{{ klantnummer }}"
+          - "VMID: {{ ct_vmid }}"
+          - "Gebruiker aangemaakt: {{ klantnummer }}"
