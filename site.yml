@@ -5,6 +5,7 @@
 
   collections:
     - community.proxmox
+    - community.crypto
 
   vars_prompt:
     - name: klantnummer
@@ -31,9 +32,16 @@
 
     proxmox_validate_certs: false
 
-    generated_key_path: "{{ playbook_dir }}/id_ed25519_{{ klantnummer }}"
+    generated_key_dir: "{{ playbook_dir }}/keys"
+    generated_key_path: "{{ generated_key_dir }}/id_ed25519_{{ klantnummer }}"
 
   tasks:
+    - name: Maak keys directory aan
+      ansible.builtin.file:
+        path: "{{ generated_key_dir }}"
+        state: directory
+        mode: "0700"
+
     - name: Genereer SSH keypair voor deze klant
       community.crypto.openssh_keypair:
         path: "{{ generated_key_path }}"
@@ -55,31 +63,24 @@
       ansible.builtin.set_fact:
         use_api_token: "{{ api_secret_string is match('^[^!]+![^=]+=.+$') }}"
 
-    - name: Stel auth-variabelen in
+    - name: Stel token-auth variabelen in
       ansible.builtin.set_fact:
-        proxmox_api_user: >-
-          {{
-            (api_secret_string | regex_replace('^([^!]+)![^=]+=.+$', '\\1'))
-            if use_api_token else proxmox_fallback_user
-          }}
-        proxmox_api_token_id: >-
-          {{
-            (api_secret_string | regex_replace('^[^!]+!([^=]+)=.+$', '\\1'))
-            if use_api_token else omit
-          }}
-        proxmox_api_token_secret: >-
-          {{
-            (api_secret_string | regex_replace('^[^!]+![^=]+=(.+)$', '\\1'))
-            if use_api_token else omit
-          }}
-        proxmox_api_password: "{{ omit if use_api_token else proxmox_fallback_password }}"
+        proxmox_api_user: "{{ api_secret_string | regex_replace('^([^!]+)![^=]+=.+$', '\\1') }}"
+        proxmox_api_token_id: "{{ api_secret_string | regex_replace('^[^!]+!([^=]+)=.+$', '\\1') }}"
+        proxmox_api_token_secret: "{{ api_secret_string | regex_replace('^[^!]+![^=]+=(.+)$', '\\1') }}"
+      when: use_api_token
 
-    - name: Maak de CT aan
+    - name: Stel password-auth variabelen in
+      ansible.builtin.set_fact:
+        proxmox_api_user: "{{ proxmox_fallback_user }}"
+        proxmox_api_password: "{{ proxmox_fallback_password }}"
+      when: not use_api_token
+
+    - name: Maak de CT aan met API token
       community.proxmox.proxmox:
         api_host: "{{ proxmox_api_host }}"
         api_port: "{{ proxmox_api_port }}"
         api_user: "{{ proxmox_api_user }}"
-        api_password: "{{ proxmox_api_password }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
         validate_certs: "{{ proxmox_validate_certs }}"
@@ -98,13 +99,37 @@
         onboot: true
         start: true
       register: ct_create
+      when: use_api_token
 
-    - name: Zoek CT-info op basis van hostname
-      community.proxmox.proxmox_vm_info:
+    - name: Maak de CT aan met gebruikersnaam en wachtwoord
+      community.proxmox.proxmox:
         api_host: "{{ proxmox_api_host }}"
         api_port: "{{ proxmox_api_port }}"
         api_user: "{{ proxmox_api_user }}"
         api_password: "{{ proxmox_api_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        state: present
+        hostname: "{{ ct_hostname }}"
+        ostemplate: "{{ ct_template }}"
+        password: "{{ proxmox_fallback_password }}"
+        memory: "{{ ct_memory_mb }}"
+        cores: "{{ ct_cores }}"
+        disk_volume:
+          storage: "{{ ct_rootfs_storage }}"
+          size: "{{ ct_disk_gb }}"
+        netif:
+          net0: "name=eth0,ip=dhcp,ip6=dhcp,bridge={{ ct_bridge }},firewall=1"
+        onboot: true
+        start: true
+      register: ct_create
+      when: not use_api_token
+
+    - name: Zoek CT-info op basis van hostname met API token
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
         validate_certs: "{{ proxmox_validate_certs }}"
@@ -112,6 +137,20 @@
         type: lxc
         name: "{{ ct_hostname }}"
       register: ct_info
+      when: use_api_token
+
+    - name: Zoek CT-info op basis van hostname met gebruikersnaam en wachtwoord
+      community.proxmox.proxmox_vm_info:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        node: "{{ proxmox_node }}"
+        type: lxc
+        name: "{{ ct_hostname }}"
+      register: ct_info
+      when: not use_api_token
 
     - name: Valideer dat precies één CT gevonden is
       ansible.builtin.assert:
@@ -123,7 +162,7 @@
       ansible.builtin.set_fact:
         ct_vmid: "{{ ct_info.proxmox_vms[0].vmid }}"
 
-    - name: Zet firewall-opties op VM/CT-niveau
+    - name: Zet firewall-opties op CT-niveau
       ansible.builtin.uri:
         url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ ct_vmid }}/firewall/options"
         method: PUT
@@ -136,13 +175,13 @@
           enable: 1
           policy_in: DROP
           policy_out: ACCEPT
+      changed_when: true
 
-    - name: Voeg inbound firewall rules toe voor 22, 80 en 443
+    - name: Voeg inbound firewall rules toe met API token
       community.proxmox.proxmox_firewall:
         api_host: "{{ proxmox_api_host }}"
         api_port: "{{ proxmox_api_port }}"
         api_user: "{{ proxmox_api_user }}"
-        api_password: "{{ proxmox_api_password }}"
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
         validate_certs: "{{ proxmox_validate_certs }}"
@@ -173,6 +212,43 @@
             pos: 2
             enable: true
             comment: "Allow HTTPS"
+      when: use_api_token
+
+    - name: Voeg inbound firewall rules toe met gebruikersnaam en wachtwoord
+      community.proxmox.proxmox_firewall:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        validate_certs: "{{ proxmox_validate_certs }}"
+        level: vm
+        node: "{{ proxmox_node }}"
+        vmid: "{{ ct_vmid }}"
+        state: present
+        update: true
+        rules:
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "22"
+            pos: 0
+            enable: true
+            comment: "Allow SSH"
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "80"
+            pos: 1
+            enable: true
+            comment: "Allow HTTP"
+          - type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "443"
+            pos: 2
+            enable: true
+            comment: "Allow HTTPS"
+      when: not use_api_token
 
     - name: Voeg Proxmox host toe aan tijdelijke inventory
       ansible.builtin.add_host:
@@ -184,8 +260,9 @@
         ct_vmid: "{{ ct_vmid }}"
         klantnummer: "{{ klantnummer }}"
         generated_public_key: "{{ generated_keypair.public_key }}"
+        generated_private_key_path: "{{ generated_key_path }}"
 
-    - name: Toon waar de private key is opgeslagen
+    - name: Toon key-locaties
       ansible.builtin.debug:
         msg:
           - "Private key opgeslagen op: {{ generated_key_path }}"
@@ -210,14 +287,14 @@
       changed_when: "'0 upgraded, 0 newly installed' not in sudo_install.stdout"
       failed_when: sudo_install.rc != 0
 
-    - name: Maak gebruiker aan
+    - name: Maak gebruiker aan als die nog niet bestaat
       ansible.builtin.shell: >
         pct exec {{ ct_vmid }} -- bash -lc
         "id -u '{{ klantnummer }}' >/dev/null 2>&1 ||
-         useradd -m -s /bin/bash '{{ klantnummer }}'"
+        useradd -m -s /bin/bash '{{ klantnummer }}'"
       changed_when: false
 
-    - name: Voeg gebruiker toe aan sudo group
+    - name: Voeg gebruiker toe aan sudo groep
       ansible.builtin.shell: >
         pct exec {{ ct_vmid }} -- bash -lc
         "usermod -aG sudo '{{ klantnummer }}'"
@@ -227,14 +304,14 @@
       ansible.builtin.shell: >
         pct exec {{ ct_vmid }} -- bash -lc
         "printf '%s ALL=(ALL) NOPASSWD:ALL\n' '{{ klantnummer }}' > /etc/sudoers.d/{{ klantnummer }} &&
-         chmod 0440 /etc/sudoers.d/{{ klantnummer }}"
+        chmod 0440 /etc/sudoers.d/{{ klantnummer }}"
       changed_when: false
 
-    - name: Maak .ssh map aan
+    - name: Maak .ssh directory aan
       ansible.builtin.shell: >
         pct exec {{ ct_vmid }} -- bash -lc
         "install -d -m 700 -o '{{ klantnummer }}' -g '{{ klantnummer }}'
-         /home/{{ klantnummer }}/.ssh"
+        /home/{{ klantnummer }}/.ssh"
       changed_when: false
 
     - name: Plaats authorized_keys
@@ -254,3 +331,4 @@
           - "VMID: {{ ct_vmid }}"
           - "Gebruiker aangemaakt: {{ klantnummer }}"
           - "SSH public key geplaatst voor gebruiker {{ klantnummer }}"
+          - "Private key staat op: {{ generated_private_key_path }}"
