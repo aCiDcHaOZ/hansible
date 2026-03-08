@@ -1,7 +1,6 @@
 ---
 - name: Update en upgrade APT packages
-  hosts: localhost
-  connection: local
+  hosts: servers
   become: yes
 
   tasks:
@@ -10,6 +9,10 @@
         update_cache: yes
         cache_valid_time: 3600
 
-    - name: Upgrade alle packages
+    - name: Upgrade packages
       ansible.builtin.apt:
         upgrade: dist
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: yes
