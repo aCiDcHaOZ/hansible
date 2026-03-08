@@ -22,7 +22,7 @@
     proxmox_fallback_user: "root@pam"
     proxmox_fallback_password: "pindakaas"
 
-    ct_hostname: "wordpress_{{ klantnummer }}"
+    ct_hostname: "wordpress-{{ klantnummer }}"
     ct_memory_mb: 512
     ct_cores: 1
     ct_bridge: "vmbr0"
