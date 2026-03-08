@@ -97,7 +97,6 @@
         netif:
           net0: "name=eth0,ip=dhcp,ip6=dhcp,bridge={{ ct_bridge }},firewall=1"
         onboot: true
-        start: true
       register: ct_create
       when: use_api_token
 
@@ -121,7 +120,6 @@
         netif:
           net0: "name=eth0,ip=dhcp,ip6=dhcp,bridge={{ ct_bridge }},firewall=1"
         onboot: true
-        start: true
       register: ct_create
       when: not use_api_token
 
@@ -161,6 +159,18 @@
     - name: Sla vmid op
       ansible.builtin.set_fact:
         ct_vmid: "{{ ct_info.proxmox_vms[0].vmid }}"
+
+    - name: Start de container
+      ansible.builtin.uri:
+        url: "https://{{ proxmox_api_host }}:{{ proxmox_api_port }}/api2/json/nodes/{{ proxmox_node }}/lxc/{{ ct_vmid }}/status/start"
+        method: POST
+        validate_certs: false
+        force_basic_auth: true
+        user: "{{ proxmox_fallback_user }}"
+        password: "{{ proxmox_fallback_password }}"
+        status_code:
+          - 200
+      changed_when: true
 
     - name: Zet firewall-opties op CT-niveau
       ansible.builtin.uri:
