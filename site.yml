@@ -1,0 +1,118 @@
+---
+- name: Maak LXC containers aan in Proxmox
+  hosts: localhost
+  gather_facts: false
+  vars:
+    proxmox_api_host: "10.24.43.2"
+    proxmox_node: "linda"
+    proxmox_api_user: "root@pam"
+    proxmox_api_token_id: "wordpress"
+    proxmox_api_token_secret: "{{ vault_proxmox_token_secret }}"
+
+    klantnummer: "{{ klantnummer }}"
+    aantal: "{{ aantal | int }}"
+    nieuwe_gebruiker: "{{ nieuwe_gebruiker }}"
+    ssh_pubkey: "{{ lookup('file', ssh_pubkey_file) }}"
+
+    ostemplate: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+    disk: "local-lvm:8"
+    memory: 512
+    swap: 512
+    cores: 1
+
+  tasks:
+    - name: Maak lijst met random VMID's
+      ansible.builtin.set_fact:
+        vmids: "{{ vmids | default([]) + [999999 | random(start=1000)] }}"
+      loop: "{{ range(0, aantal) | list }}"
+
+    - name: Maak containers aan
+      community.proxmox.proxmox:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        hostname: "{{ klantnummer }}-{{ item }}"
+        ostemplate: "{{ ostemplate }}"
+        disk: "{{ disk }}"
+        memory: "{{ memory }}"
+        swap: "{{ swap }}"
+        cores: "{{ cores }}"
+        password: "tijdelijkRootWachtwoord123!"
+        pubkey: "{{ ssh_pubkey }}"
+        netif:
+          net0: "name=eth0,bridge=vmbr0,ip=dhcp"
+        features:
+          - "nesting=1"
+        state: present
+      loop: "{{ vmids }}"
+      register: created_cts
+
+    - name: Start containers
+      community.proxmox.proxmox:
+        api_host: "{{ proxmox_api_host }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_token_id: "{{ proxmox_api_token_id }}"
+        api_token_secret: "{{ proxmox_api_token_secret }}"
+        node: "{{ proxmox_node }}"
+        vmid: "{{ item }}"
+        state: started
+      loop: "{{ vmids }}"
+
+    - name: Voeg containers dynamisch toe aan inventory
+      ansible.builtin.add_host:
+        name: "ct-{{ item }}"
+        groups: new_lxc
+        ansible_host: "{{ proxmox_api_host }}"
+        ansible_connection: community.proxmox.proxmox_pct_remote
+        ansible_user: root
+        proxmox_vmid: "{{ item }}"
+      loop: "{{ vmids }}"
+
+- name: Provision nieuwe containers
+  hosts: new_lxc
+  gather_facts: false
+  become: true
+  vars:
+    nieuwe_gebruiker: "{{ hostvars['localhost']['nieuwe_gebruiker'] }}"
+    ssh_pubkey: "{{ hostvars['localhost']['ssh_pubkey'] }}"
+
+  tasks:
+    - name: Wacht tot shell in container beschikbaar is
+      ansible.builtin.raw: "sh -c 'echo ready'"
+      register: shell_ready
+      retries: 30
+      delay: 2
+      until: shell_ready is succeeded
+
+    - name: Installeer sudo en openssh-server
+      ansible.builtin.apt:
+        name:
+          - sudo
+          - openssh-server
+        update_cache: true
+        state: present
+
+    - name: Maak gebruiker aan
+      ansible.builtin.user:
+        name: "{{ nieuwe_gebruiker }}"
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+
+    - name: Voeg SSH public key toe
+      ansible.posix.authorized_key:
+        user: "{{ nieuwe_gebruiker }}"
+        key: "{{ ssh_pubkey }}"
+        state: present
+
+    - name: Geef passwordless sudo
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ nieuwe_gebruiker }}"
+        content: "{{ nieuwe_gebruiker }} ALL=(ALL:ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
