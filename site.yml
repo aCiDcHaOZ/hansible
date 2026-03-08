@@ -11,23 +11,17 @@
       prompt: "Geef het klantnummer op"
       private: false
 
-    - name: ssh_public_key
-      prompt: "Plak de SSH public key voor de nieuwe gebruiker"
-      private: false
-
   vars:
     proxmox_api_host: "10.24.43.2"
     proxmox_api_port: 8006
     proxmox_node: "linda"
 
-    # Als api_secret in het formaat user@realm!tokenid=secret staat,
-    # wordt token-auth gebruikt. Anders valt het playbook terug op root@pam + wachtwoord.
     api_secret_file: "{{ playbook_dir }}/api_secret"
 
     proxmox_fallback_user: "root@pam"
     proxmox_fallback_password: "pindakaas"
 
-    ct_hostname: "wordpress-{{ klantnummer }}"
+    ct_hostname: "wordpress_{{ klantnummer }}"
     ct_memory_mb: 512
     ct_cores: 1
     ct_bridge: "vmbr0"
@@ -35,10 +29,19 @@
     ct_rootfs_storage: "local"
     ct_template: "local:vztemp1/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
 
-    # Nodig voor de community.proxmox modules bij self-signed certs
     proxmox_validate_certs: false
 
+    generated_key_path: "{{ playbook_dir }}/id_ed25519_{{ klantnummer }}"
+
   tasks:
+    - name: Genereer SSH keypair voor deze klant
+      community.crypto.openssh_keypair:
+        path: "{{ generated_key_path }}"
+        type: ed25519
+        mode: "0600"
+        force: false
+      register: generated_keypair
+
     - name: Lees api_secret bestand
       ansible.builtin.slurp:
         src: "{{ api_secret_file }}"
@@ -80,24 +83,18 @@
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
         validate_certs: "{{ proxmox_validate_certs }}"
-
         node: "{{ proxmox_node }}"
         state: present
-
         hostname: "{{ ct_hostname }}"
         ostemplate: "{{ ct_template }}"
         password: "{{ proxmox_fallback_password }}"
-
         memory: "{{ ct_memory_mb }}"
         cores: "{{ ct_cores }}"
-
         disk_volume:
           storage: "{{ ct_rootfs_storage }}"
           size: "{{ ct_disk_gb }}"
-
         netif:
           net0: "name=eth0,ip=dhcp,ip6=dhcp,bridge={{ ct_bridge }},firewall=1"
-
         onboot: true
         start: true
       register: ct_create
@@ -139,7 +136,6 @@
           enable: 1
           policy_in: DROP
           policy_out: ACCEPT
-      register: firewall_options_result
 
     - name: Voeg inbound firewall rules toe voor 22, 80 en 443
       community.proxmox.proxmox_firewall:
@@ -150,7 +146,6 @@
         api_token_id: "{{ proxmox_api_token_id }}"
         api_token_secret: "{{ proxmox_api_token_secret }}"
         validate_certs: "{{ proxmox_validate_certs }}"
-
         level: vm
         node: "{{ proxmox_node }}"
         vmid: "{{ ct_vmid }}"
@@ -188,7 +183,13 @@
         ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
         ct_vmid: "{{ ct_vmid }}"
         klantnummer: "{{ klantnummer }}"
-        ssh_public_key: "{{ ssh_public_key }}"
+        generated_public_key: "{{ generated_keypair.public_key }}"
+
+    - name: Toon waar de private key is opgeslagen
+      ansible.builtin.debug:
+        msg:
+          - "Private key opgeslagen op: {{ generated_key_path }}"
+          - "Public key opgeslagen op: {{ generated_key_path }}.pub"
 
 - name: Maak gebruiker aan in de container
   hosts: proxmox_linda
@@ -240,7 +241,7 @@
       ansible.builtin.shell: >
         pct exec {{ ct_vmid }} -- bash -lc
         "cat > /home/{{ klantnummer }}/.ssh/authorized_keys <<'EOF'
-        {{ ssh_public_key }}
+        {{ generated_public_key }}
         EOF
         chown {{ klantnummer }}:{{ klantnummer }} /home/{{ klantnummer }}/.ssh/authorized_keys &&
         chmod 600 /home/{{ klantnummer }}/.ssh/authorized_keys"
@@ -252,3 +253,4 @@
           - "CT aangemaakt: wordpress_{{ klantnummer }}"
           - "VMID: {{ ct_vmid }}"
           - "Gebruiker aangemaakt: {{ klantnummer }}"
+          - "SSH public key geplaatst voor gebruiker {{ klantnummer }}"
