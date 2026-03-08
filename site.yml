@@ -28,7 +28,7 @@
     ct_bridge: "vmbr0"
     ct_disk_gb: 10
     ct_rootfs_storage: "local"
-    ct_template: "local:vztemp1/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+    ct_template: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
 
     proxmox_validate_certs: false
 
