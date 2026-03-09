@@ -13,8 +13,8 @@
 
     vm_storage: "ceph-pool"
 
-    vm_memory: 2048
-    vm_cores: 2
+    vm_memory: 1024
+    vm_cores: 1
     vm_bridge: "vmbr0"
     vm_gateway: "10.24.43.1"
     vm_cidr: "24"
