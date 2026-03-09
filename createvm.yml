@@ -18,11 +18,13 @@
     vm_bridge: "vmbr0"
     vm_gateway: "10.24.43.1"
     vm_cidr: "24"
-    vm_ci_user: "{{ klantnummer }}"
     vm_nameservers:
       - "1.1.1.1"
       - "8.8.8.8"
     vm_searchdomain: "lan"
+
+    vm_bootstrap_user: "lionel"
+    vm_bootstrap_password: "{{ lookup('ansible.builtin.file', playbook_dir + '/pwd_secret') | trim }}"
 
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
 
@@ -87,7 +89,7 @@
         vm_hostname: "vm-{{ klantnummer }}"
         vm_name: "vm-{{ klantnummer }}"
         vm_vmid: "{{ klantnummer | int }}"
-        vm_username: "{{ klantnummer }}"
+        vm_username: "user{{ klantnummer }}"
         vm_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
         vm_ip_address: "{{ ip_manager_result.stdout | trim }}"
 
@@ -136,11 +138,12 @@
               net0: "virtio,bridge={{ vm_bridge }},firewall=1"
             ipconfig:
               ipconfig0: "ip={{ vm_ip_address }}/{{ vm_cidr }},gw={{ vm_gateway }}"
-            ciuser: "{{ vm_ci_user }}"
+            ciuser: "{{ vm_bootstrap_user }}"
+            cipassword: "{{ vm_bootstrap_password }}"
             sshkeys: "{{ vm_ssh_public_key }}"
             nameservers: "{{ vm_nameservers }}"
             searchdomains: "{{ vm_searchdomain }}"
-          no_log: true
+          no_log: true 
 
         - name: Start de VM
           community.proxmox.proxmox_kvm:
@@ -154,9 +157,78 @@
             state: started
           no_log: true
 
+        - name: Wacht tot SSH op de VM bereikbaar is
+          ansible.builtin.wait_for:
+            host: "{{ vm_ip_address }}"
+            port: 22
+            delay: 5
+            timeout: 300
+            state: started
+
         - name: Wacht kort zodat cloud-init volledig is toegepast
           ansible.builtin.pause:
-            seconds: 20
+            seconds: 15
+
+        
+                - name: Verwijder oude SSH host key voor de VM uit known_hosts
+          ansible.builtin.command: >
+            ssh-keygen -f {{ local_home }}/.ssh/known_hosts -R {{ vm_ip_address }}
+          failed_when: false
+          changed_when: true
+
+        - name: Voeg actuele SSH host key van de VM toe aan known_hosts
+          ansible.builtin.shell: >
+            mkdir -p {{ local_home }}/.ssh &&
+            ssh-keyscan -H {{ vm_ip_address }} >> {{ local_home }}/.ssh/known_hosts
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Maak unieke gebruiker aan met sudo rechten
+          ansible.builtin.shell: |
+            sshpass -p '{{ vm_bootstrap_password }}' ssh {{ vm_bootstrap_user }}@{{ vm_ip_address }} '
+            sudo bash -lc "
+            id -u {{ vm_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ vm_username }}
+            usermod -aG sudo {{ vm_username }}
+            echo \"{{ vm_username }} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/{{ vm_username }}
+            chmod 440 /etc/sudoers.d/{{ vm_username }}
+            mkdir -p /home/{{ vm_username }}/.ssh
+            chmod 700 /home/{{ vm_username }}/.ssh
+            cat > /home/{{ vm_username }}/.ssh/authorized_keys <<\"EOF\"
+            {{ vm_ssh_public_key }}
+            EOF
+            chmod 600 /home/{{ vm_username }}/.ssh/authorized_keys
+            chown -R {{ vm_username }}:{{ vm_username }} /home/{{ vm_username }}/.ssh
+            "'
+          args:
+            executable: /bin/bash
+          no_log: true
+        
+        
+        
+        
+        
+        
+        
+        - name: Maak unieke gebruiker aan met sudo rechten
+          ansible.builtin.shell: |
+            sshpass -p '{{ vm_bootstrap_password }}' ssh -o StrictHostKeyChecking=no {{ vm_bootstrap_user }}@{{ vm_ip_address }} '
+            sudo bash -lc "
+            id -u {{ vm_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ vm_username }}
+            usermod -aG sudo {{ vm_username }}
+            echo \"{{ vm_username }} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/{{ vm_username }}
+            chmod 440 /etc/sudoers.d/{{ vm_username }}
+            mkdir -p /home/{{ vm_username }}/.ssh
+            chmod 700 /home/{{ vm_username }}/.ssh
+            cat > /home/{{ vm_username }}/.ssh/authorized_keys <<\"EOF\"
+            {{ vm_ssh_public_key }}
+            EOF
+            chmod 600 /home/{{ vm_username }}/.ssh/authorized_keys
+            chown -R {{ vm_username }}:{{ vm_username }} /home/{{ vm_username }}/.ssh
+            "'
+          args:
+            executable: /bin/bash
+          no_log: false
 
         - name: Enable firewall op VM via Proxmox CLI
           ansible.builtin.shell: >
@@ -267,6 +339,14 @@
     - name: Toon gebruikte GoldenRecord VMID
       ansible.builtin.debug:
         msg: "GoldenRecord VMID op node {{ proxmox_node }} is {{ vm_template_vmid }}"
+
+    - name: Toon bootstrap user
+      ansible.builtin.debug:
+        msg: "Bootstrap user voor eerste login is {{ vm_bootstrap_user }}"
+
+    - name: Toon aangemaakte eindgebruiker
+      ansible.builtin.debug:
+        msg: "Aangemaakte Linux gebruiker met sudo rechten: {{ vm_username }}"
 
     - name: Toon toegewezen IP-adres
       ansible.builtin.debug:
