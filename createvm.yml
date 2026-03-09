@@ -1,0 +1,264 @@
+---
+- name: Maak VM op Proxmox vanuit GoldenRecord
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - community.proxmox
+    - community.crypto
+
+  vars:
+    proxmox_api_port: 8006
+    proxmox_api_user: "root@pam"
+    proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
+
+    vm_template_name: "GoldenRecord"
+    vm_storage: "ceph-pool"
+
+    vm_memory: 2048
+    vm_cores: 2
+    vm_bridge: "vmbr0"
+    vm_gateway: "10.24.43.1"
+    vm_cidr: "24"
+    vm_ci_user: "{{ klantnummer }}"
+    vm_nameservers:
+      - "1.1.1.1"
+      - "8.8.8.8"
+    vm_searchdomain: "lan"
+
+    local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+
+  pre_tasks:
+    - name: Controleer dat klantnummer is opgegeven
+      ansible.builtin.assert:
+        that:
+          - klantnummer is defined
+          - klantnummer | string | length > 0
+        fail_msg: "Geef een klantnummer op via -e klantnummer=123"
+
+    - name: Controleer dat inventorygroep servers bestaat en hosts bevat
+      ansible.builtin.assert:
+        that:
+          - groups['servers'] is defined
+          - groups['servers'] | length > 0
+        fail_msg: "De inventorygroep [servers] ontbreekt of bevat geen hosts"
+
+    - name: Kies willekeurige PVE-host
+      ansible.builtin.set_fact:
+        selected_pve_host: "{{ groups['servers'] | random }}"
+
+    - name: Controleer dat goldenrecord_vmid aanwezig is voor gekozen host
+      ansible.builtin.assert:
+        that:
+          - hostvars[selected_pve_host].goldenrecord_vmid is defined
+          - hostvars[selected_pve_host].goldenrecord_vmid | string | length > 0
+        fail_msg: "Definieer goldenrecord_vmid voor elke host in hosts.ini"
+
+    - name: Stel Proxmox hostgegevens vast
+      ansible.builtin.set_fact:
+        proxmox_node: "{{ selected_pve_host }}"
+        proxmox_api_host: "{{ hostvars[selected_pve_host].ansible_host | default(selected_pve_host) }}"
+        vm_template_vmid: "{{ hostvars[selected_pve_host].goldenrecord_vmid | int }}"
+
+    - name: Vraag een vrij IP-adres op
+      ansible.builtin.command: "./ip_manager.sh give"
+      args:
+        chdir: "{{ playbook_dir }}"
+      register: ip_manager_result
+      changed_when: false
+
+    - name: Controleer dat ip_manager een IP-adres heeft teruggegeven
+      ansible.builtin.assert:
+        that:
+          - ip_manager_result.stdout is defined
+          - ip_manager_result.stdout | trim | length > 0
+        fail_msg: "ip_manager.sh give gaf geen IP-adres terug"
+
+    - name: Zorg dat ~/keys bestaat
+      ansible.builtin.file:
+        path: "{{ local_home }}/keys"
+        state: directory
+        mode: "0700"
+
+    - name: Stel hostname, VMID, gebruikersnaam, keypad en IP vast
+      ansible.builtin.set_fact:
+        vm_hostname: "vm-{{ klantnummer }}"
+        vm_name: "vm-{{ klantnummer }}"
+        vm_vmid: "{{ klantnummer | int }}"
+        vm_username: "{{ klantnummer }}"
+        vm_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
+        vm_ip_address: "{{ ip_manager_result.stdout | trim }}"
+
+    - name: Genereer SSH keypair voor de klantgebruiker
+      community.crypto.openssh_keypair:
+        path: "{{ vm_ssh_key_path }}"
+        type: ed25519
+        comment: "{{ vm_username }}@{{ vm_hostname }}"
+        mode: "0600"
+      register: vm_ssh_keypair
+
+    - name: Bewaar publieke SSH key
+      ansible.builtin.set_fact:
+        vm_ssh_public_key: "{{ vm_ssh_keypair.public_key }}"
+
+  tasks:
+    - block:
+        - name: Clone de VM vanuit GoldenRecord op de gekozen node
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            clone: "{{ vm_template_name }}"
+            vmid: "{{ vm_template_vmid }}"
+            newid: "{{ vm_vmid }}"
+            name: "{{ vm_name }}"
+            storage: "{{ vm_storage }}"
+            full: false
+            timeout: 600
+          no_log: true
+
+        - name: Configureer de VM en cloud-init
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ vm_vmid }}"
+            name: "{{ vm_name }}"
+            update: true
+            update_unsafe: true
+            cores: "{{ vm_cores }}"
+            memory: "{{ vm_memory }}"
+            onboot: true
+            agent: "enabled=1"
+            net:
+              net0: "virtio,bridge={{ vm_bridge }},firewall=1"
+            ipconfig:
+              ipconfig0: "ip={{ vm_ip_address }}/{{ vm_cidr }},gw={{ vm_gateway }}"
+            ciuser: "{{ vm_ci_user }}"
+            sshkeys: "{{ vm_ssh_public_key }}"
+            nameservers: "{{ vm_nameservers }}"
+            searchdomains: "{{ vm_searchdomain }}"
+          no_log: true
+
+        - name: Voeg firewallregels toe aan de VM
+          community.proxmox.proxmox_firewall:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            level: vm
+            vmid: "{{ vm_vmid }}"
+            state: present
+            rules:
+              - pos: 0
+                type: in
+                action: ACCEPT
+                proto: tcp
+                dport: "22"
+                iface: net0
+                enable: true
+                comment: "Allow SSH"
+              - pos: 1
+                type: in
+                action: DROP
+                iface: net0
+                enable: true
+                comment: "Drop all other ingress"
+          no_log: true
+
+        - name: Start de VM
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ vm_vmid }}"
+            state: started
+          no_log: true
+
+        - name: Wacht kort zodat cloud-init volledig is toegepast
+          ansible.builtin.pause:
+            seconds: 15
+
+      rescue:
+        - name: Stop de VM als die bestaat
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ vm_vmid }}"
+            state: stopped
+          ignore_errors: true
+          no_log: true
+
+        - name: Verwijder half aangemaakte VM
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ vm_vmid }}"
+            state: absent
+          ignore_errors: true
+          no_log: true
+
+        - name: Geef IP-adres terug aan pool
+          ansible.builtin.command: "./ip_manager.sh remove {{ vm_ip_address }}"
+          args:
+            chdir: "{{ playbook_dir }}"
+          when: vm_ip_address is defined
+          ignore_errors: true
+
+        - name: Verwijder lokale private key bij failure
+          ansible.builtin.file:
+            path: "{{ vm_ssh_key_path }}"
+            state: absent
+          ignore_errors: true
+
+        - name: Verwijder lokale public key bij failure
+          ansible.builtin.file:
+            path: "{{ vm_ssh_key_path }}.pub"
+            state: absent
+          ignore_errors: true
+
+        - name: Stop playbook omdat provisioning faalde
+          ansible.builtin.fail:
+            msg: "Provisioning van VM {{ vm_hostname }} op node {{ proxmox_node }} mislukt. VM is verwijderd, IP {{ vm_ip_address }} is teruggegeven en lokale keys zijn opgeruimd."
+
+    - name: Toon gekozen PVE-host
+      ansible.builtin.debug:
+        msg: "VM wordt aangemaakt op node {{ proxmox_node }} (API host {{ proxmox_api_host }})"
+
+    - name: Toon gebruikte GoldenRecord VMID
+      ansible.builtin.debug:
+        msg: "Template VMID op node {{ proxmox_node }} is {{ vm_template_vmid }}"
+
+    - name: Toon toegewezen IP-adres
+      ansible.builtin.debug:
+        msg: "VM {{ vm_hostname }} heeft IP-adres {{ vm_ip_address }}/{{ vm_cidr }} met gateway {{ vm_gateway }}"
+
+    - name: Toon locatie van private key
+      ansible.builtin.debug:
+        msg: "{{ vm_ssh_key_path }}"
+
+    - name: Toon locatie van public key
+      ansible.builtin.debug:
+        msg: "{{ vm_ssh_key_path }}.pub"
+
+    - name: Toon de publieke SSH key
+      ansible.builtin.debug:
+        msg: "{{ vm_ssh_public_key }}"
