@@ -13,8 +13,8 @@
 
     vm_storage: "ceph-pool"
 
-    vm_memory: 1024
-    vm_cores: 1
+    vm_memory: 2048
+    vm_cores: 2
     vm_bridge: "vmbr0"
     vm_gateway: "10.24.43.1"
     vm_cidr: "24"
@@ -141,7 +141,7 @@
             onboot: true
             agent: "enabled=1"
             net:
-              net0: "virtio,bridge={{ vm_bridge }},firewall=1,rate=50"
+              net0: "virtio,bridge={{ vm_bridge }},firewall=1"
             ipconfig:
               ipconfig0: "ip={{ vm_ip_address }}/{{ vm_cidr }},gw={{ vm_gateway }}"
             ciuser: "{{ vm_bootstrap_user }}"
@@ -260,6 +260,14 @@
                 iface: net0
                 enable: true
                 comment: "Drop all other ingress"
+          no_log: true
+          
+        - name: Voeg VM toe aan Proxmox HA
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+            "ha-manager add vm:{{ vm_vmid }}"
+          args:
+            executable: /bin/bash
           no_log: true
 
       rescue:
