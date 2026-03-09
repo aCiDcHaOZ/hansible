@@ -10,7 +10,7 @@
     proxmox_api_port: 8006
     proxmox_node: "linda"
     proxmox_api_user: "root@pam"
-    proxmox_api_password: "pindakaas"
+    proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
 
     ct_rootfs_storage: "local-lvm"
     ct_template: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
@@ -59,6 +59,7 @@
 
         onboot: true
         unprivileged: true
+      no_log: true
 
     - name: Voeg firewallregels toe aan de CT
       community.proxmox.proxmox_firewall:
@@ -106,6 +107,7 @@
             iface: net0
             enable: true
             comment: "Drop all other ingress"
+      no_log: true
 
     - name: Start de CT
       community.proxmox.proxmox:
@@ -118,3 +120,4 @@
         node: "{{ proxmox_node }}"
         vmid: "{{ ct_vmid }}"
         state: started
+      no_log: true
