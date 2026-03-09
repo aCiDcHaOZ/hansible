@@ -28,9 +28,10 @@
           - klantnummer | length > 0
         fail_msg: "Geef een klantnummer op via -e klantnummer=123"
 
-    - name: Stel hostname vast
+    - name: Stel hostname en VMID vast
       ansible.builtin.set_fact:
         ct_hostname: "wordpress-{{ klantnummer }}"
+        ct_vmid: "{{ klantnummer | int }}"
 
   tasks:
     - name: Maak de CT aan
@@ -42,6 +43,7 @@
         validate_certs: false
 
         node: "{{ proxmox_node }}"
+        vmid: "{{ ct_vmid }}"
         state: present
 
         hostname: "{{ ct_hostname }}"
@@ -58,6 +60,53 @@
         onboot: true
         unprivileged: true
 
+    - name: Voeg firewallregels toe aan de CT
+      community.proxmox.proxmox_firewall:
+        api_host: "{{ proxmox_api_host }}"
+        api_port: "{{ proxmox_api_port }}"
+        api_user: "{{ proxmox_api_user }}"
+        api_password: "{{ proxmox_api_password }}"
+        validate_certs: false
+
+        node: "{{ proxmox_node }}"
+        level: vm
+        vmid: "{{ ct_vmid }}"
+        state: present
+        rules:
+          - pos: 0
+            type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "22"
+            iface: net0
+            enable: true
+            comment: "Allow SSH"
+
+          - pos: 1
+            type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "80"
+            iface: net0
+            enable: true
+            comment: "Allow HTTP"
+
+          - pos: 2
+            type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "443"
+            iface: net0
+            enable: true
+            comment: "Allow HTTPS"
+
+          - pos: 3
+            type: in
+            action: DROP
+            iface: net0
+            enable: true
+            comment: "Drop all other ingress"
+
     - name: Start de CT
       community.proxmox.proxmox:
         api_host: "{{ proxmox_api_host }}"
@@ -67,7 +116,5 @@
         validate_certs: false
 
         node: "{{ proxmox_node }}"
-        hostname: "{{ ct_hostname }}"
+        vmid: "{{ ct_vmid }}"
         state: started
-          - "SSH public key geplaatst voor gebruiker {{ klantnummer }}"
-          - "Private key staat op: {{ generated_private_key_path }}"
