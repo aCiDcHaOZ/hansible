@@ -20,6 +20,9 @@
     ct_cores: 1
     ct_disk: "local-lvm:10"
     ct_bridge: "vmbr0"
+    ct_gateway: "10.24.43.1"
+    ct_cidr: "24"
+
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
 
   pre_tasks:
@@ -30,18 +33,33 @@
           - klantnummer | length > 0
         fail_msg: "Geef een klantnummer op via -e klantnummer=123"
 
+    - name: Vraag een vrij IP-adres op
+      ansible.builtin.command: ./ip_manager.sh give
+      args:
+        chdir: "{{ playbook_dir }}"
+      register: ip_manager_result
+      changed_when: false
+
+    - name: Controleer dat ip_manager een IP-adres heeft teruggegeven
+      ansible.builtin.assert:
+        that:
+          - ip_manager_result.stdout is defined
+          - ip_manager_result.stdout | trim | length > 0
+        fail_msg: "ip_manager.sh give gaf geen IP-adres terug"
+
     - name: Zorg dat ~/keys bestaat
       ansible.builtin.file:
         path: "{{ local_home }}/keys"
         state: directory
         mode: "0700"
 
-    - name: Stel hostname, VMID, gebruikersnaam en keypad vast
+    - name: Stel hostname, VMID, gebruikersnaam, keypad en IP vast
       ansible.builtin.set_fact:
         ct_hostname: "wordpress-{{ klantnummer }}"
         ct_vmid: "{{ klantnummer | int }}"
         ct_username: "{{ klantnummer }}"
         ct_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
+        ct_ip_address: "{{ ip_manager_result.stdout | trim }}"
 
     - name: Genereer SSH keypair voor de klantgebruiker
       community.crypto.openssh_keypair:
@@ -73,7 +91,7 @@
         memory: "{{ ct_memory }}"
         disk: "{{ ct_disk }}"
         netif:
-          net0: "name=eth0,bridge={{ ct_bridge }},ip=dhcp,firewall=1"
+          net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1"
         onboot: true
         unprivileged: true
       no_log: true
@@ -167,6 +185,10 @@
       args:
         executable: /bin/bash
       no_log: true
+
+    - name: Toon toegewezen IP-adres
+      ansible.builtin.debug:
+        msg: "CT {{ ct_hostname }} heeft IP-adres {{ ct_ip_address }}/{{ ct_cidr }} met gateway {{ ct_gateway }}"
 
     - name: Toon de publieke SSH key
       ansible.builtin.debug:
