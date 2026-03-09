@@ -105,7 +105,7 @@
             memory: "{{ ct_memory }}"
             disk: "{{ ct_disk }}"
             netif:
-              net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1"
+              net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1,rate=50"
             onboot: true
             unprivileged: true
           no_log: false
