@@ -141,7 +141,7 @@
             onboot: true
             agent: "enabled=1"
             net:
-              net0: "virtio,bridge={{ vm_bridge }},firewall=1"
+              net0: "virtio,bridge={{ vm_bridge }},firewall=1,rate=50"
             ipconfig:
               ipconfig0: "ip={{ vm_ip_address }}/{{ vm_cidr }},gw={{ vm_gateway }}"
             ciuser: "{{ vm_bootstrap_user }}"
