@@ -115,7 +115,7 @@
             newid: "{{ vm_vmid }}"
             name: "{{ vm_name }}"
             storage: "{{ vm_storage }}"
-            full: false
+            full: true
             timeout: 600
           no_log: true
 
