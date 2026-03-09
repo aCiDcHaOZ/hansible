@@ -13,7 +13,6 @@
     proxmox_api_user: "root@pam"
     proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
 
-    ct_rootfs_storage: "local-lvm"
     ct_template: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
 
     ct_memory: 512
@@ -188,15 +187,42 @@
           no_log: true
 
       rescue:
+        - name: Stop de CT als die bestaat
+          community.proxmox.proxmox:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ ct_vmid }}"
+            state: stopped
+          ignore_errors: true
+          no_log: true
+
+        - name: Verwijder half aangemaakte CT
+          community.proxmox.proxmox:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ ct_vmid }}"
+            state: absent
+          ignore_errors: true
+          no_log: true
+
         - name: Geef IP-adres terug aan pool
           ansible.builtin.command: "./ip_manager.sh remove {{ ct_ip_address }}"
           args:
             chdir: "{{ playbook_dir }}"
           when: ct_ip_address is defined
+          ignore_errors: true
 
-        - name: Stop playbook omdat provisioning faalde
+        - name: Meld dat provisioning is teruggedraaid
           ansible.builtin.fail:
-            msg: "Provisioning van CT {{ ct_hostname }} mislukt. IP {{ ct_ip_address }} is teruggegeven aan de pool."
+            msg: "Provisioning van CT {{ ct_hostname }} mislukt. Half aangemaakte CT is verwijderd en IP {{ ct_ip_address }} is teruggegeven aan de pool."
 
     - name: Toon toegewezen IP-adres
       ansible.builtin.debug:
