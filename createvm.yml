@@ -11,7 +11,6 @@
     proxmox_api_user: "root@pam"
     proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
 
-    vm_template_name: "GoldenRecord"
     vm_storage: "ceph-pool"
 
     vm_memory: 2048
@@ -110,7 +109,7 @@
             api_password: "{{ proxmox_api_password }}"
             validate_certs: false
             node: "{{ proxmox_node }}"
-            clone: "{{ vm_template_name }}"
+            clone: "ignored-because-vmid-is-used"
             vmid: "{{ vm_template_vmid }}"
             newid: "{{ vm_vmid }}"
             name: "{{ vm_name }}"
@@ -145,6 +144,22 @@
             searchdomains: "{{ vm_searchdomain }}"
           no_log: true
 
+        - name: Start de VM
+          community.proxmox.proxmox_kvm:
+            api_host: "{{ proxmox_api_host }}"
+            api_port: "{{ proxmox_api_port }}"
+            api_user: "{{ proxmox_api_user }}"
+            api_password: "{{ proxmox_api_password }}"
+            validate_certs: false
+            node: "{{ proxmox_node }}"
+            vmid: "{{ vm_vmid }}"
+            state: started
+          no_log: true
+
+        - name: Wacht kort zodat cloud-init volledig is toegepast
+          ansible.builtin.pause:
+            seconds: 20
+
         - name: Voeg firewallregels toe aan de VM
           community.proxmox.proxmox_firewall:
             api_host: "{{ proxmox_api_host }}"
@@ -167,27 +182,27 @@
                 comment: "Allow SSH"
               - pos: 1
                 type: in
+                action: ACCEPT
+                proto: tcp
+                dport: "80"
+                iface: net0
+                enable: true
+                comment: "Allow HTTP"
+              - pos: 2
+                type: in
+                action: ACCEPT
+                proto: tcp
+                dport: "443"
+                iface: net0
+                enable: true
+                comment: "Allow HTTPS"
+              - pos: 3
+                type: in
                 action: DROP
                 iface: net0
                 enable: true
                 comment: "Drop all other ingress"
           no_log: true
-
-        - name: Start de VM
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
-            node: "{{ proxmox_node }}"
-            vmid: "{{ vm_vmid }}"
-            state: started
-          no_log: true
-
-        - name: Wacht kort zodat cloud-init volledig is toegepast
-          ansible.builtin.pause:
-            seconds: 15
 
       rescue:
         - name: Stop de VM als die bestaat
