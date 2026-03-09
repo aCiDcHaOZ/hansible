@@ -84,6 +84,12 @@
         state: directory
         mode: "0700"
 
+    - name: Zorg dat ~/.ssh bestaat
+      ansible.builtin.file:
+        path: "{{ local_home }}/.ssh"
+        state: directory
+        mode: "0700"
+
     - name: Stel hostname, VMID, gebruikersnaam, keypad en IP vast
       ansible.builtin.set_fact:
         vm_hostname: "vm-{{ klantnummer }}"
@@ -143,7 +149,7 @@
             sshkeys: "{{ vm_ssh_public_key }}"
             nameservers: "{{ vm_nameservers }}"
             searchdomains: "{{ vm_searchdomain }}"
-          no_log: true 
+          no_log: true
 
         - name: Start de VM
           community.proxmox.proxmox_kvm:
@@ -169,8 +175,7 @@
           ansible.builtin.pause:
             seconds: 15
 
-        
-                - name: Verwijder oude SSH host key voor de VM uit known_hosts
+        - name: Verwijder oude SSH host key voor de VM uit known_hosts
           ansible.builtin.command: >
             ssh-keygen -f {{ local_home }}/.ssh/known_hosts -R {{ vm_ip_address }}
           failed_when: false
@@ -178,7 +183,6 @@
 
         - name: Voeg actuele SSH host key van de VM toe aan known_hosts
           ansible.builtin.shell: >
-            mkdir -p {{ local_home }}/.ssh &&
             ssh-keyscan -H {{ vm_ip_address }} >> {{ local_home }}/.ssh/known_hosts
           args:
             executable: /bin/bash
@@ -186,7 +190,9 @@
 
         - name: Maak unieke gebruiker aan met sudo rechten
           ansible.builtin.shell: |
-            sshpass -p '{{ vm_bootstrap_password }}' ssh {{ vm_bootstrap_user }}@{{ vm_ip_address }} '
+            sshpass -p '{{ vm_bootstrap_password }}' ssh \
+              -o StrictHostKeyChecking=yes \
+              {{ vm_bootstrap_user }}@{{ vm_ip_address }} '
             sudo bash -lc "
             id -u {{ vm_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ vm_username }}
             usermod -aG sudo {{ vm_username }}
@@ -203,32 +209,6 @@
           args:
             executable: /bin/bash
           no_log: true
-        
-        
-        
-        
-        
-        
-        
-        - name: Maak unieke gebruiker aan met sudo rechten
-          ansible.builtin.shell: |
-            sshpass -p '{{ vm_bootstrap_password }}' ssh -o StrictHostKeyChecking=no {{ vm_bootstrap_user }}@{{ vm_ip_address }} '
-            sudo bash -lc "
-            id -u {{ vm_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ vm_username }}
-            usermod -aG sudo {{ vm_username }}
-            echo \"{{ vm_username }} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/{{ vm_username }}
-            chmod 440 /etc/sudoers.d/{{ vm_username }}
-            mkdir -p /home/{{ vm_username }}/.ssh
-            chmod 700 /home/{{ vm_username }}/.ssh
-            cat > /home/{{ vm_username }}/.ssh/authorized_keys <<\"EOF\"
-            {{ vm_ssh_public_key }}
-            EOF
-            chmod 600 /home/{{ vm_username }}/.ssh/authorized_keys
-            chown -R {{ vm_username }}:{{ vm_username }} /home/{{ vm_username }}/.ssh
-            "'
-          args:
-            executable: /bin/bash
-          no_log: false
 
         - name: Enable firewall op VM via Proxmox CLI
           ansible.builtin.shell: >
