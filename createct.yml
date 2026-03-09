@@ -7,9 +7,7 @@
     - community.crypto
 
   vars:
-    proxmox_api_host: "10.24.43.2"
     proxmox_api_port: 8006
-    proxmox_node: "linda"
     proxmox_api_user: "root@pam"
     proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
 
@@ -31,6 +29,22 @@
           - klantnummer is defined
           - klantnummer | string | length > 0
         fail_msg: "Geef een klantnummer op via -e klantnummer=123"
+
+    - name: Controleer dat inventorygroep servers bestaat en hosts bevat
+      ansible.builtin.assert:
+        that:
+          - groups['servers'] is defined
+          - groups['servers'] | length > 0
+        fail_msg: "De inventorygroep [servers] ontbreekt of bevat geen hosts"
+
+    - name: Kies willekeurige PVE-host
+      ansible.builtin.set_fact:
+        selected_pve_host: "{{ groups['servers'] | random }}"
+
+    - name: Stel Proxmox hostgegevens vast
+      ansible.builtin.set_fact:
+        proxmox_node: "{{ selected_pve_host }}"
+        proxmox_api_host: "{{ hostvars[selected_pve_host].ansible_host | default(selected_pve_host) }}"
 
     - name: Vraag een vrij IP-adres op
       ansible.builtin.command: "./ip_manager.sh give"
@@ -94,7 +108,7 @@
               net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1"
             onboot: true
             unprivileged: true
-          no_log: true
+          no_log: false
 
         - name: Voeg firewallregels toe aan de CT
           community.proxmox.proxmox_firewall:
@@ -220,9 +234,25 @@
           when: ct_ip_address is defined
           ignore_errors: true
 
-        - name: Meld dat provisioning is teruggedraaid
+        - name: Verwijder lokale private key bij failure
+          ansible.builtin.file:
+            path: "{{ ct_ssh_key_path }}"
+            state: absent
+          ignore_errors: true
+
+        - name: Verwijder lokale public key bij failure
+          ansible.builtin.file:
+            path: "{{ ct_ssh_key_path }}.pub"
+            state: absent
+          ignore_errors: true
+
+        - name: Stop playbook omdat provisioning faalde
           ansible.builtin.fail:
-            msg: "Provisioning van CT {{ ct_hostname }} mislukt. Half aangemaakte CT is verwijderd en IP {{ ct_ip_address }} is teruggegeven aan de pool."
+            msg: "Provisioning van CT {{ ct_hostname }} op node {{ proxmox_node }} mislukt. CT is verwijderd, IP {{ ct_ip_address }} is teruggegeven en lokale keys zijn opgeruimd."
+
+    - name: Toon gekozen PVE-host
+      ansible.builtin.debug:
+        msg: "CT wordt aangemaakt op node {{ proxmox_node }} (API host {{ proxmox_api_host }})"
 
     - name: Toon toegewezen IP-adres
       ansible.builtin.debug:
@@ -239,3 +269,4 @@
     - name: Toon de publieke SSH key
       ansible.builtin.debug:
         msg: "{{ ct_ssh_public_key }}"
+
