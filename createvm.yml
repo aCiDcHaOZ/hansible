@@ -45,6 +45,10 @@
       ansible.builtin.set_fact:
         selected_pve_host: "{{ groups['servers'] | random }}"
 
+    - name: Toon willekeurig gekozen PVE-host
+      ansible.builtin.debug:
+        msg: "Willekeurig gekozen PVE-host: {{ selected_pve_host }}"
+
     - name: Controleer dat goldenrecord_vmid aanwezig is voor gekozen host
       ansible.builtin.assert:
         that:
@@ -101,21 +105,15 @@
 
   tasks:
     - block:
-        - name: Clone de VM vanuit GoldenRecord op de gekozen node
-          community.proxmox.proxmox_kvm:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
-            node: "{{ proxmox_node }}"
-            clone: "ignored-because-vmid-is-used"
-            vmid: "{{ vm_template_vmid }}"
-            newid: "{{ vm_vmid }}"
-            name: "{{ vm_name }}"
-            storage: "{{ vm_storage }}"
-            full: true
-            timeout: 600
+        - name: Clone de VM vanuit GoldenRecord VMID op de gekozen node
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+            "qm clone {{ vm_template_vmid }} {{ vm_vmid }}
+            --name {{ vm_name }}
+            --full 1
+            --storage {{ vm_storage }}"
+          args:
+            executable: /bin/bash
           no_log: true
 
         - name: Configureer de VM en cloud-init
@@ -159,6 +157,14 @@
         - name: Wacht kort zodat cloud-init volledig is toegepast
           ansible.builtin.pause:
             seconds: 20
+
+        - name: Enable firewall op VM via Proxmox CLI
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+            "pvesh set /nodes/{{ proxmox_node }}/qemu/{{ vm_vmid }}/firewall/options -enable 1"
+          args:
+            executable: /bin/bash
+          no_log: true
 
         - name: Voeg firewallregels toe aan de VM
           community.proxmox.proxmox_firewall:
@@ -260,7 +266,7 @@
 
     - name: Toon gebruikte GoldenRecord VMID
       ansible.builtin.debug:
-        msg: "Template VMID op node {{ proxmox_node }} is {{ vm_template_vmid }}"
+        msg: "GoldenRecord VMID op node {{ proxmox_node }} is {{ vm_template_vmid }}"
 
     - name: Toon toegewezen IP-adres
       ansible.builtin.debug:
