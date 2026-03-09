@@ -6,12 +6,9 @@
     - community.proxmox
 
   vars:
-    proxmox_api_host: "10.24.43.2"
     proxmox_api_port: 8006
-    proxmox_node: "linda"
     proxmox_api_user: "root@pam"
     proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
-
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
 
   pre_tasks:
@@ -22,31 +19,59 @@
           - klantnummer | string | length > 0
         fail_msg: "Geef een klantnummer op via -e klantnummer=123"
 
+    - name: Controleer dat inventorygroep servers bestaat en hosts bevat
+      ansible.builtin.assert:
+        that:
+          - groups['servers'] is defined
+          - groups['servers'] | length > 0
+        fail_msg: "Inventorygroep 'servers' ontbreekt of bevat geen hosts."
+
     - name: Stel hostname, VMID en keypaden vast
       ansible.builtin.set_fact:
         ct_hostname: "wordpress-{{ klantnummer }}"
         ct_vmid: "{{ klantnummer | int }}"
         ct_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
 
-    - name: Lees CT-config uit Proxmox
+    - name: Zoek op welke Proxmox-node de CT staat
       ansible.builtin.shell: >
-        ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+        ssh -o StrictHostKeyChecking=no root@{{ hostvars[item].ansible_host }}
         "pct config {{ ct_vmid }}"
       args:
         executable: /bin/bash
-      register: ct_config_result
+      loop: "{{ groups['servers'] }}"
+      register: ct_lookup_results
       changed_when: false
       failed_when: false
 
+    - name: Bepaal lookup-resultaat van de juiste node
+      ansible.builtin.set_fact:
+        ct_found_result: >-
+          {{
+            (
+              ct_lookup_results.results
+              | selectattr('rc', 'equalto', 0)
+              | list
+              | first
+            ) | default({})
+          }}
+
     - name: Bepaal of de CT bestaat
       ansible.builtin.set_fact:
-        ct_exists: "{{ ct_config_result.rc == 0 }}"
+        ct_exists: "{{ ct_found_result != {} }}"
+
+    - name: Stel Proxmox hostgegevens vast van gevonden CT
+      ansible.builtin.set_fact:
+        selected_pve_host: "{{ ct_found_result.item }}"
+        proxmox_api_host: "{{ hostvars[ct_found_result.item].ansible_host }}"
+        proxmox_node: "{{ hostvars[ct_found_result.item].proxmox_node }}"
+        ct_config_stdout_lines: "{{ ct_found_result.stdout_lines | default([]) }}"
+      when: ct_exists
 
     - name: Haal net0-config uit CT-config
       ansible.builtin.set_fact:
         ct_net0_line: >-
           {{
-            (ct_config_result.stdout_lines | default([])
+            (ct_config_stdout_lines
             | select('match', '^net0:')
             | list
             | first
@@ -116,11 +141,12 @@
               Verwijderen van CT {{ ct_hostname }} is mislukt.
               Controleer handmatig of de CT, keys en het IP-adres zijn opgeruimd.
 
-    - name: Toon resultaat CT
+    - name: Toon gevonden node
       ansible.builtin.debug:
         msg: >-
           {% if ct_exists %}
-          CT {{ ct_hostname }} (VMID {{ ct_vmid }}) is verwijderd.
+          CT {{ ct_hostname }} (VMID {{ ct_vmid }}) stond op host {{ selected_pve_host }}
+          met node {{ proxmox_node }} en is verwijderd.
           {% else %}
           CT {{ ct_hostname }} (VMID {{ ct_vmid }}) bestond niet meer.
           {% endif %}
