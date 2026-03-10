@@ -8,9 +8,15 @@
     - ansible.posix
 
   vars:
+    local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+
+    proxmox_api_host: "10.24.43.3"
     proxmox_api_port: 8006
-    proxmox_api_user: "root@pam"
-    proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
+    proxmox_secret_file: "{{ local_home }}/secrets/proxmox_secret"
+
+    proxmox_api_user: "{{ lookup('ansible.builtin.ini', 'api_user type=properties file=' + proxmox_secret_file) | trim }}"
+    proxmox_api_token_id: "{{ lookup('ansible.builtin.ini', 'api_token_id type=properties file=' + proxmox_secret_file) | trim }}"
+    proxmox_api_token_secret: "{{ lookup('ansible.builtin.ini', 'api_token_secret type=properties file=' + proxmox_secret_file) | trim }}"
 
     ct_template: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
 
@@ -23,11 +29,26 @@
 
     netdata_parent_ip: "10.24.43.6"
     netdata_parent_port: "19999"
-    netdata_stream_api_key: "{{ lookup('ansible.builtin.file', 'netdata_secret') | trim }}"
+    netdata_stream_api_key: "{{ lookup('ansible.builtin.file', local_home + '/secrets/netdata_secret') | trim }}"
 
-    local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ proxmox_api_host }}"
+      api_port: "{{ proxmox_api_port }}"
+      api_user: "{{ proxmox_api_user }}"
+      api_token_id: "{{ proxmox_api_token_id }}"
+      api_token_secret: "{{ proxmox_api_token_secret }}"
+      validate_certs: false
 
   pre_tasks:
+    - name: Controleer Proxmox credentials uit secretbestand
+      ansible.builtin.assert:
+        that:
+          - proxmox_api_user | length > 0
+          - proxmox_api_token_id | length > 0
+          - proxmox_api_token_secret | length > 0
+        fail_msg: "Bestand ~/secrets/proxmox_secret mist api_user, api_token_id of api_token_secret"
+
     - name: Controleer dat klantnummer is opgegeven
       ansible.builtin.assert:
         that:
@@ -47,7 +68,7 @@
         that:
           - netdata_stream_api_key is defined
           - netdata_stream_api_key | length > 0
-        fail_msg: "Bestand netdata_secret ontbreekt of bevat geen geldige Netdata API key"
+        fail_msg: "Bestand ~/secrets/netdata_secret ontbreekt of bevat geen geldige Netdata API key"
 
     - name: Kies willekeurige PVE-host
       ansible.builtin.set_fact:
@@ -105,17 +126,12 @@
       block:
         - name: Maak de CT aan
           community.proxmox.proxmox:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: present
             hostname: "{{ ct_hostname }}"
             ostemplate: "{{ ct_template }}"
-            password: "{{ proxmox_api_password }}"
+            password: "{{ lookup('ansible.builtin.file', local_home + '/secrets/pwd_secret') | trim }}"
             cores: "{{ ct_cores }}"
             memory: "{{ ct_memory }}"
             disk: "{{ ct_disk }}"
@@ -126,11 +142,6 @@
 
         - name: Voeg firewallregels toe aan de CT
           community.proxmox.proxmox_firewall:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             level: vm
             vmid: "{{ ct_vmid }}"
@@ -169,11 +180,6 @@
 
         - name: Start de CT
           community.proxmox.proxmox:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: started
@@ -198,11 +204,6 @@
       rescue:
         - name: Stop de CT als die bestaat
           community.proxmox.proxmox:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: stopped
@@ -210,11 +211,6 @@
 
         - name: Verwijder half aangemaakte CT
           community.proxmox.proxmox:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: absent
@@ -270,11 +266,11 @@
   vars:
     netdata_parent_ip: "10.24.43.6"
     netdata_parent_port: "19999"
-    netdata_stream_api_key: "{{ lookup('ansible.builtin.file', 'netdata_secret') | trim }}"
+    local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
+    netdata_stream_api_key: "{{ lookup('ansible.builtin.file', local_home + '/secrets/netdata_secret') | trim }}"
     ct_gateway: "10.24.43.1"
     ct_cidr: "24"
-    local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
-    ct_username: "{{ klantnummer }}"
+    ct_username: "user{{ klantnummer }}"
     ct_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
     ct_ssh_public_key: "{{ lookup('ansible.builtin.file', ct_ssh_key_path + '.pub') | trim }}"
 
