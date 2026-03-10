@@ -386,30 +386,25 @@
       delay: 2
       until: netdata_status.stdout | trim == "active"
 
-    - name: Toon gekozen PVE-host
+    - name: Toon provisioning samenvatting
       ansible.builtin.debug:
-        msg: "CT wordt aangemaakt op node {{ hostvars['localhost'].proxmox_node }} (API host {{ hostvars['localhost'].proxmox_api_host }})"
+        msg: |
+          Provisioning van {{ hostvars['localhost'].ct_hostname }} is voltooid.
 
-    - name: Toon toegewezen IP-adres
-      ansible.builtin.debug:
-        msg: "CT {{ hostvars['localhost'].ct_hostname }} heeft IP-adres {{ hostvars['localhost'].ct_ip_address }}/{{ ct_cidr }} met gateway {{ ct_gateway }}"
+          Inloggen als gebruiker:
+          {{ ct_username }}
 
-    - name: Toon locatie van private key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_key_path }}"
+          Uitgegeven IP-adres:
+          {{ hostvars['localhost'].ct_ip_address }}
 
-    - name: Toon locatie van public key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_key_path }}.pub"
+          Publieke SSH key van de aangemaakte user:
+          {{ ct_ssh_public_key }}
 
-    - name: Toon de publieke SSH key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_public_key }}"
+          Lokale private key:
+          {{ ct_ssh_key_path }}
 
-    - name: Toon Netdata parent configuratie
-      ansible.builtin.debug:
-        msg: "Netdata child streamt naar {{ netdata_parent_ip }}:{{ netdata_parent_port }}"
+          Lokale public key:
+          {{ ct_ssh_key_path }}.pub
 
-    - name: Toon uiteindelijke Netdata service status
-      ansible.builtin.debug:
-        msg: "{{ netdata_status.stdout | trim }}"
+          SSH login-commando:
+          ssh -i {{ ct_ssh_key_path }} {{ ct_username }}@{{ hostvars['localhost'].ct_ip_address }}
