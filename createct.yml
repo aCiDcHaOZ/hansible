@@ -82,7 +82,7 @@
       ansible.builtin.set_fact:
         ct_hostname: "wordpress-{{ klantnummer }}"
         ct_vmid: "{{ klantnummer | int }}"
-        ct_username: "{{ klantnummer }}"
+        ct_username: "user{{ klantnummer }}"
         ct_ip_address: "{{ ip_manager_result.stdout | trim }}"
         ct_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
 
