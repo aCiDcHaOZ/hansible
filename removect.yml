@@ -17,6 +17,7 @@
     proxmox_api_token_secret: "{{ lookup('ansible.builtin.ini', 'api_token_secret type=properties file=' + proxmox_secret_file) | trim }}"
 
     ct_ssh_key_dir: "{{ local_home }}/keys"
+    root_known_hosts_file: "/root/.ssh/known_hosts"
 
   module_defaults:
     group/community.proxmox.proxmox:
@@ -128,6 +129,31 @@
           when: ct_exists
           no_log: true
 
+        - name: Controleer of /root/.ssh/known_hosts bestaat
+          ansible.builtin.stat:
+            path: "{{ root_known_hosts_file }}"
+          register: root_known_hosts_stat
+
+        - name: Verwijder CT-hostname uit /root/.ssh/known_hosts
+          ansible.builtin.command:
+            cmd: "ssh-keygen -R {{ ct_hostname }} -f {{ root_known_hosts_file }}"
+          register: remove_known_host_hostname
+          when: root_known_hosts_stat.stat.exists
+          changed_when: >
+            'not found' not in (remove_known_host_hostname.stderr | default('') | lower)
+          failed_when: false
+
+        - name: Verwijder CT-IP uit /root/.ssh/known_hosts
+          ansible.builtin.command:
+            cmd: "ssh-keygen -R {{ ct_ip_address }} -f {{ root_known_hosts_file }}"
+          when:
+            - root_known_hosts_stat.stat.exists
+            - ct_ip_address is defined
+          register: remove_known_host_ip
+          changed_when: >
+            'not found' not in (remove_known_host_ip.stderr | default('') | lower)
+          failed_when: false
+
         - name: Verwijder lokale private key
           ansible.builtin.file:
             path: "{{ ct_ssh_key_path }}"
@@ -147,6 +173,28 @@
           changed_when: ip_remove_result.rc == 0
 
       rescue:
+        - name: Controleer of /root/.ssh/known_hosts bestaat bij failure
+          ansible.builtin.stat:
+            path: "{{ root_known_hosts_file }}"
+          register: root_known_hosts_stat_rescue
+          failed_when: false
+
+        - name: Verwijder CT-hostname uit /root/.ssh/known_hosts bij failure
+          ansible.builtin.command:
+            cmd: "ssh-keygen -R {{ ct_hostname }} -f {{ root_known_hosts_file }}"
+          when: root_known_hosts_stat_rescue.stat.exists | default(false)
+          failed_when: false
+          changed_when: false
+
+        - name: Verwijder CT-IP uit /root/.ssh/known_hosts bij failure
+          ansible.builtin.command:
+            cmd: "ssh-keygen -R {{ ct_ip_address }} -f {{ root_known_hosts_file }}"
+          when:
+            - root_known_hosts_stat_rescue.stat.exists | default(false)
+            - ct_ip_address is defined
+          failed_when: false
+          changed_when: false
+
         - name: Verwijder lokale private key bij failure
           ansible.builtin.file:
             path: "{{ ct_ssh_key_path }}"
@@ -170,7 +218,7 @@
           ansible.builtin.fail:
             msg: >-
               Verwijderen van CT {{ ct_hostname }} is mislukt.
-              Controleer handmatig of de CT, keys en het IP-adres zijn opgeruimd.
+              Controleer handmatig of de CT, keys, known_hosts en het IP-adres zijn opgeruimd.
 
   post_tasks:
     - name: Toon gevonden node
@@ -186,6 +234,12 @@
       ansible.builtin.debug:
         msg: "Lokale keys verwijderd: {{ ct_ssh_key_path }} en {{ ct_ssh_key_path }}.pub"
 
+    - name: Toon resultaat known_hosts cleanup
+      ansible.builtin.debug:
+        msg: >-
+          SSH known_hosts opgeschoond voor {{ ct_hostname }}
+          {% if ct_ip_address is defined %}en {{ ct_ip_address }}{% endif %}.
+
     - name: Toon resultaat IP-release
       ansible.builtin.debug:
         msg: >-
@@ -194,5 +248,4 @@
           {% else %}
           Er is geen IP-adres uit de CT-config gehaald, dus er is niets teruggegeven aan ip_manager.
           {% endif %}
-          Er is geen IP-adres uit de CT-config gehaald, dus er is niets teruggegeven aan ip_manager.
           {% endif %}
