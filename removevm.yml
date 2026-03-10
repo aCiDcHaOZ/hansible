@@ -1,17 +1,41 @@
 ---
-- name: Verwijder VM op Proxmox
+- name: Verwijder VM op Proxmox via API
   hosts: localhost
   gather_facts: false
   collections:
     - community.proxmox
 
   vars:
-    proxmox_api_port: 8006
-    proxmox_api_user: "root@pam"
-    proxmox_api_password: "{{ lookup('ansible.builtin.file', 'pwd_secret') | trim }}"
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
 
+    proxmox_api_host: "10.24.43.3"
+    proxmox_api_port: 8006
+    proxmox_secret_file: "{{ local_home }}/secrets/proxmox_secret"
+
+    proxmox_api_user: "{{ lookup('ansible.builtin.ini', 'api_user type=properties file=' + proxmox_secret_file) | trim }}"
+    proxmox_api_token_id: "{{ lookup('ansible.builtin.ini', 'api_token_id type=properties file=' + proxmox_secret_file) | trim }}"
+    proxmox_api_token_secret: "{{ lookup('ansible.builtin.ini', 'api_token_secret type=properties file=' + proxmox_secret_file) | trim }}"
+
+    vm_ssh_key_dir: "{{ local_home }}/keys"
+
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ proxmox_api_host }}"
+      api_port: "{{ proxmox_api_port }}"
+      api_user: "{{ proxmox_api_user }}"
+      api_token_id: "{{ proxmox_api_token_id }}"
+      api_token_secret: "{{ proxmox_api_token_secret }}"
+      validate_certs: false
+
   pre_tasks:
+    - name: Controleer Proxmox credentials uit secretbestand
+      ansible.builtin.assert:
+        that:
+          - proxmox_api_user | length > 0
+          - proxmox_api_token_id | length > 0
+          - proxmox_api_token_secret | length > 0
+        fail_msg: "Bestand ~/secrets/proxmox_secret mist api_user, api_token_id of api_token_secret"
+
     - name: Controleer dat klantnummer is opgegeven
       ansible.builtin.assert:
         that:
@@ -19,69 +43,37 @@
           - klantnummer | string | length > 0
         fail_msg: "Geef een klantnummer op via -e klantnummer=123"
 
-    - name: Controleer dat inventorygroep servers bestaat en hosts bevat
-      ansible.builtin.assert:
-        that:
-          - groups['servers'] is defined
-          - groups['servers'] | length > 0
-        fail_msg: "Inventorygroep 'servers' ontbreekt of bevat geen hosts."
-
-    - name: Stel hostname, VMID en keypaden vast
+    - name: Stel VM-identiteit en keypaden vast
       ansible.builtin.set_fact:
         vm_hostname: "vm-{{ klantnummer }}"
+        vm_name: "vm-{{ klantnummer }}"
         vm_vmid: "{{ klantnummer | int }}"
-        vm_ssh_key_path: "{{ local_home }}/keys/id_ed25519_{{ klantnummer }}"
+        vm_ssh_key_path: "{{ vm_ssh_key_dir }}/id_ed25519_{{ klantnummer }}"
 
-    - name: Zoek op welke Proxmox-node de VM staat
-      ansible.builtin.shell: >
-        ssh -o StrictHostKeyChecking=no root@{{ hostvars[item].ansible_host }}
-        "qm config {{ vm_vmid }}"
-      args:
-        executable: /bin/bash
-      loop: "{{ groups['servers'] }}"
-      register: vm_lookup_results
-      changed_when: false
-      failed_when: false
-
-    - name: Bepaal lookup-resultaat van de juiste node
-      ansible.builtin.set_fact:
-        vm_found_result: >-
-          {{
-            (
-              vm_lookup_results.results
-              | selectattr('rc', 'equalto', 0)
-              | list
-              | first
-            ) | default({})
-          }}
+    - name: Haal VM-info op via Proxmox API
+      community.proxmox.proxmox_vm_info:
+        type: qemu
+        vmid: "{{ vm_vmid }}"
+        config: current
+      register: vm_info_result
 
     - name: Bepaal of de VM bestaat
       ansible.builtin.set_fact:
-        vm_exists: "{{ vm_found_result != {} }}"
+        vm_exists: "{{ (vm_info_result.proxmox_vms | default([]) | length) > 0 }}"
 
-    - name: Stel Proxmox hostgegevens vast van gevonden VM
+    - name: Zet VM-record vast
       ansible.builtin.set_fact:
-        selected_pve_host: "{{ vm_found_result.item }}"
-        proxmox_api_host: "{{ hostvars[vm_found_result.item].ansible_host }}"
-        proxmox_node: "{{ hostvars[vm_found_result.item].proxmox_node | default(vm_found_result.item) }}"
-        vm_config_stdout_lines: "{{ vm_found_result.stdout_lines | default([]) }}"
+        vm_info: "{{ vm_info_result.proxmox_vms[0] }}"
       when: vm_exists
 
-    - name: Haal ipconfig0-config uit VM-config
+    - name: Stel node, status en config vast
       ansible.builtin.set_fact:
-        vm_ipconfig0_line: >-
-          {{
-            (
-              vm_config_stdout_lines
-              | select('match', '^ipconfig0:')
-              | list
-              | first
-              | default('')
-            )
-          }}
+        proxmox_node: "{{ vm_info.node }}"
+        vm_current_status: "{{ vm_info.status | default('unknown') }}"
+        vm_ipconfig0_line: "{{ vm_info.config.ipconfig0 | default('') }}"
       when: vm_exists
 
-    - name: Haal IP-adres uit ipconfig0-config
+    - name: Extraheer IP-adres uit ipconfig0
       ansible.builtin.set_fact:
         vm_ip_address: "{{ vm_ipconfig0_line | regex_search('ip=([0-9.]+)/(\\d+)', '\\1') | first }}"
       when:
@@ -89,32 +81,82 @@
         - vm_ipconfig0_line | length > 0
         - vm_ipconfig0_line is search('ip=[0-9.]+/[0-9]+')
 
+    - name: Bepaal of de VM vermoedelijk in HA zit
+      community.proxmox.proxmox_cluster_ha_resources:
+        name: "vm:{{ vm_vmid }}"
+        state: absent
+      check_mode: true
+      register: ha_probe_result
+      failed_when: false
+      when: vm_exists
+
+    - name: Zet HA-status vast
+      ansible.builtin.set_fact:
+        vm_is_ha: "{{ ha_probe_result.changed | default(false) }}"
+      when: vm_exists
+
   tasks:
     - block:
-        - name: Stop de VM
+        - name: Verwijder VM uit Proxmox HA
+          community.proxmox.proxmox_cluster_ha_resources:
+            name: "vm:{{ vm_vmid }}"
+            state: absent
+          when:
+            - vm_exists
+            - vm_is_ha | default(false)
+          no_log: true
+
+        - name: Geef Proxmox even tijd na HA-remove
+          ansible.builtin.pause:
+            seconds: 5
+          when:
+            - vm_exists
+            - vm_is_ha | default(false)
+
+        - name: Stop de VM geforceerd
           community.proxmox.proxmox_kvm:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ vm_vmid }}"
             state: stopped
+            force: true
+            timeout: 300
           when: vm_exists
-          ignore_errors: true
           no_log: true
 
-        - name: Verwijder de VM
+        - name: Wacht tot VM echt gestopt is
+          community.proxmox.proxmox_vm_info:
+            type: qemu
+            vmid: "{{ vm_vmid }}"
+          register: vm_stop_check
+          retries: 24
+          delay: 5
+          until: >
+            (vm_stop_check.proxmox_vms | default([]) | length) == 0
+            or
+            ((vm_stop_check.proxmox_vms | first).status | default('stopped')) == 'stopped'
+          failed_when: false
+          when: vm_exists
+          no_log: true
+
+        - name: Verwijder de VM volledig
           community.proxmox.proxmox_kvm:
-            api_host: "{{ proxmox_api_host }}"
-            api_port: "{{ proxmox_api_port }}"
-            api_user: "{{ proxmox_api_user }}"
-            api_password: "{{ proxmox_api_password }}"
-            validate_certs: false
             node: "{{ proxmox_node }}"
             vmid: "{{ vm_vmid }}"
             state: absent
+            purge: true
+            timeout: 300
+          when: vm_exists
+          no_log: true
+
+        - name: Wacht tot VM uit cluster verdwenen is
+          community.proxmox.proxmox_vm_info:
+            type: qemu
+            vmid: "{{ vm_vmid }}"
+          register: vm_absent_check
+          retries: 24
+          delay: 5
+          until: (vm_absent_check.proxmox_vms | default([]) | length) == 0
+          failed_when: false
           when: vm_exists
           no_log: true
 
@@ -137,20 +179,50 @@
           changed_when: ip_remove_result.rc == 0
 
       rescue:
+        - name: Verwijder lokale private key bij failure
+          ansible.builtin.file:
+            path: "{{ vm_ssh_key_path }}"
+            state: absent
+          failed_when: false
+
+        - name: Verwijder lokale public key bij failure
+          ansible.builtin.file:
+            path: "{{ vm_ssh_key_path }}.pub"
+            state: absent
+          failed_when: false
+
+        - name: Geef IP-adres alsnog terug aan ip_manager
+          ansible.builtin.command: "./ip_manager.sh remove {{ vm_ip_address }}"
+          args:
+            chdir: "{{ playbook_dir }}"
+          when: vm_ip_address is defined
+          failed_when: false
+
         - name: Meld teardown failure
           ansible.builtin.fail:
             msg: >-
               Verwijderen van VM {{ vm_hostname }} is mislukt.
-              Controleer handmatig of de VM, keys en het IP-adres zijn opgeruimd.
+              Controleer handmatig of HA-resource, VM, keys en IP-adres zijn opgeruimd.
 
-    - name: Toon gevonden node
+  post_tasks:
+    - name: Toon resultaat VM
       ansible.builtin.debug:
         msg: >-
           {% if vm_exists %}
-          VM {{ vm_hostname }} (VMID {{ vm_vmid }}) stond op host {{ selected_pve_host }}
-          met node {{ proxmox_node }} en is verwijderd.
+          VM {{ vm_hostname }} (VMID {{ vm_vmid }}) op node {{ proxmox_node }} is verwijderd.
           {% else %}
           VM {{ vm_hostname }} (VMID {{ vm_vmid }}) bestond niet meer.
+          {% endif %}
+
+    - name: Toon resultaat HA
+      ansible.builtin.debug:
+        msg: >-
+          {% if vm_exists and (vm_is_ha | default(false)) %}
+          VM {{ vm_hostname }} zat in Proxmox HA en is eerst uit HA verwijderd.
+          {% elif vm_exists %}
+          VM {{ vm_hostname }} zat niet in Proxmox HA.
+          {% else %}
+          Geen HA-controle nodig, omdat de VM niet meer bestond.
           {% endif %}
 
     - name: Toon resultaat keys
