@@ -20,6 +20,14 @@
     ct_gateway: "10.24.43.1"
     ct_cidr: "24"
 
+    netdata_parent_ip: "10.24.43.6"
+    netdata_parent_port: "19999"
+    netdata_stream_api_key: "{{ lookup('ansible.builtin.file', 'netdata_secret') | trim }}"
+
+    netdata_initial_wait_seconds: 5
+    netdata_status_retries: 10
+    netdata_status_delay_seconds: 2
+
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
 
   pre_tasks:
@@ -36,6 +44,13 @@
           - groups['servers'] is defined
           - groups['servers'] | length > 0
         fail_msg: "De inventorygroep [servers] ontbreekt of bevat geen hosts"
+
+    - name: Controleer dat Netdata API key aanwezig is
+      ansible.builtin.assert:
+        that:
+          - netdata_stream_api_key is defined
+          - netdata_stream_api_key | length > 0
+        fail_msg: "Bestand netdata_secret ontbreekt of bevat geen geldige Netdata API key"
 
     - name: Kies willekeurige PVE-host
       ansible.builtin.set_fact:
@@ -66,7 +81,7 @@
         state: directory
         mode: "0700"
 
-    - name: Stel hostname, VMID, gebruikersnaam, keypad en IP vast
+    - name: Stel hostname, VMID, gebruikersnaam en IP vast
       ansible.builtin.set_fact:
         ct_hostname: "wordpress-{{ klantnummer }}"
         ct_vmid: "{{ klantnummer | int }}"
@@ -88,6 +103,7 @@
 
   tasks:
     - block:
+
         - name: Maak de CT aan
           community.proxmox.proxmox:
             api_host: "{{ proxmox_api_host }}"
@@ -108,7 +124,6 @@
               net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1,rate=50"
             onboot: true
             unprivileged: true
-          no_log: false
 
         - name: Voeg firewallregels toe aan de CT
           community.proxmox.proxmox_firewall:
@@ -129,7 +144,6 @@
                 dport: "22"
                 iface: net0
                 enable: true
-                comment: "Allow SSH"
               - pos: 1
                 type: in
                 action: ACCEPT
@@ -137,7 +151,6 @@
                 dport: "80"
                 iface: net0
                 enable: true
-                comment: "Allow HTTP"
               - pos: 2
                 type: in
                 action: ACCEPT
@@ -145,14 +158,11 @@
                 dport: "443"
                 iface: net0
                 enable: true
-                comment: "Allow HTTPS"
               - pos: 3
                 type: in
                 action: DROP
                 iface: net0
                 enable: true
-                comment: "Drop all other ingress"
-          no_log: true
 
         - name: Start de CT
           community.proxmox.proxmox:
@@ -164,44 +174,81 @@
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: started
-          no_log: true
 
-        - name: Wacht kort zodat de CT volledig is opgestart
+        - name: Wacht tot CT is opgestart
           ansible.builtin.pause:
             seconds: 8
 
         - name: Maak gebruiker aan in de CT
           ansible.builtin.shell: >
             ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
-            "pct exec {{ ct_vmid }} -- sh -lc 'id -u {{ ct_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ ct_username }}'"
-          args:
-            executable: /bin/bash
-          no_log: true
+            "pct exec {{ ct_vmid }} -- sh -c 'id -u {{ ct_username }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ ct_username }}'"
 
-        - name: Maak .ssh directory aan in de CT
-          ansible.builtin.shell: >
-            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
-            "pct exec {{ ct_vmid }} -- sh -lc 'mkdir -p /home/{{ ct_username }}/.ssh &&
-            chmod 700 /home/{{ ct_username }}/.ssh &&
-            chown {{ ct_username }}:{{ ct_username }} /home/{{ ct_username }}/.ssh'"
-          args:
-            executable: /bin/bash
-          no_log: true
-
-        - name: Zet public key in authorized_keys in de CT
+        - name: Installeer Netdata
           ansible.builtin.shell: |
             ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }} \
-            "pct exec {{ ct_vmid }} -- sh -lc 'cat > /home/{{ ct_username }}/.ssh/authorized_keys <<\"EOF\"
-            {{ ct_ssh_public_key }}
-            EOF
-            chmod 600 /home/{{ ct_username }}/.ssh/authorized_keys
-            chown {{ ct_username }}:{{ ct_username }} /home/{{ ct_username }}/.ssh/authorized_keys'"
-          args:
-            executable: /bin/bash
-          no_log: true
+            "pct exec {{ ct_vmid }} -- sh -c '
+            export DEBIAN_FRONTEND=noninteractive
+            if ! command -v netdata >/dev/null 2>&1; then
+              apt-get update
+              apt-get install -y curl ca-certificates
+              curl -fsSL https://get.netdata.cloud/kickstart.sh -o /tmp/netdata-kickstart.sh
+              sh /tmp/netdata-kickstart.sh --non-interactive
+            fi'"
+
+        - name: Configureer Netdata streaming
+          ansible.builtin.shell: |
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }} \
+            "pct exec {{ ct_vmid }} -- sh -c 'cat > /etc/netdata/stream.conf <<\"EOF\"
+            [stream]
+                enabled = yes
+                destination = {{ netdata_parent_ip }}:{{ netdata_parent_port }}
+                api key = {{ netdata_stream_api_key }}
+                timeout seconds = 60
+                send charts matching = *
+                buffer size bytes = 1048576
+                reconnect delay seconds = 5
+                initial clock resync iterations = 60
+            EOF'"
+
+        - name: Maak systemd override voor Netdata (LXC)
+          ansible.builtin.shell: |
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }} \
+            "pct exec {{ ct_vmid }} -- sh -c 'mkdir -p /etc/systemd/system/netdata.service.d &&
+            cat > /etc/systemd/system/netdata.service.d/lxc.conf <<\"EOF\"
+            [Service]
+            PrivateTmp=no
+            PrivateDevices=no
+            ProtectSystem=off
+            ProtectHome=no
+            ProtectControlGroups=no
+            ProtectKernelModules=no
+            ProtectKernelTunables=no
+            PrivateUsers=no
+            RestrictNamespaces=no
+            ProtectProc=default
+            ProcSubset=all
+            EOF'"
+
+        - name: Herstart Netdata
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+            "pct exec {{ ct_vmid }} -- systemctl daemon-reload &&
+             pct exec {{ ct_vmid }} -- systemctl enable netdata &&
+             pct exec {{ ct_vmid }} -- systemctl restart netdata"
+
+        - name: Wacht tot Netdata actief is
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }}
+            "pct exec {{ ct_vmid }} -- systemctl is-active netdata || true"
+          register: netdata_status
+          retries: "{{ netdata_status_retries }}"
+          delay: "{{ netdata_status_delay_seconds }}"
+          until: netdata_status.stdout | trim == "active"
+          changed_when: false
 
       rescue:
-        - name: Stop de CT als die bestaat
+        - name: Stop de CT
           community.proxmox.proxmox:
             api_host: "{{ proxmox_api_host }}"
             api_port: "{{ proxmox_api_port }}"
@@ -212,9 +259,8 @@
             vmid: "{{ ct_vmid }}"
             state: stopped
           ignore_errors: true
-          no_log: true
 
-        - name: Verwijder half aangemaakte CT
+        - name: Verwijder CT
           community.proxmox.proxmox:
             api_host: "{{ proxmox_api_host }}"
             api_port: "{{ proxmox_api_port }}"
@@ -225,48 +271,21 @@
             vmid: "{{ ct_vmid }}"
             state: absent
           ignore_errors: true
-          no_log: true
 
-        - name: Geef IP-adres terug aan pool
+        - name: Geef IP terug aan pool
           ansible.builtin.command: "./ip_manager.sh remove {{ ct_ip_address }}"
           args:
             chdir: "{{ playbook_dir }}"
-          when: ct_ip_address is defined
           ignore_errors: true
 
-        - name: Verwijder lokale private key bij failure
-          ansible.builtin.file:
-            path: "{{ ct_ssh_key_path }}"
-            state: absent
-          ignore_errors: true
-
-        - name: Verwijder lokale public key bij failure
-          ansible.builtin.file:
-            path: "{{ ct_ssh_key_path }}.pub"
-            state: absent
-          ignore_errors: true
-
-        - name: Stop playbook omdat provisioning faalde
+        - name: Stop playbook
           ansible.builtin.fail:
-            msg: "Provisioning van CT {{ ct_hostname }} op node {{ proxmox_node }} mislukt. CT is verwijderd, IP {{ ct_ip_address }} is teruggegeven en lokale keys zijn opgeruimd."
+            msg: "Provisioning van CT {{ ct_hostname }} is mislukt."
 
-    - name: Toon gekozen PVE-host
+    - name: Toon resultaat
       ansible.builtin.debug:
-        msg: "CT wordt aangemaakt op node {{ proxmox_node }} (API host {{ proxmox_api_host }})"
-
-    - name: Toon toegewezen IP-adres
-      ansible.builtin.debug:
-        msg: "CT {{ ct_hostname }} heeft IP-adres {{ ct_ip_address }}/{{ ct_cidr }} met gateway {{ ct_gateway }}"
-
-    - name: Toon locatie van private key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_key_path }}"
-
-    - name: Toon locatie van public key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_key_path }}.pub"
-
-    - name: Toon de publieke SSH key
-      ansible.builtin.debug:
-        msg: "{{ ct_ssh_public_key }}"
-
+        msg: |
+          CT {{ ct_hostname }} succesvol aangemaakt
+          Node: {{ proxmox_node }}
+          IP: {{ ct_ip_address }}
+          Netdata parent: {{ netdata_parent_ip }}
