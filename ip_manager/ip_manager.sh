@@ -1,85 +1,98 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Define the path to configuration and database files.
-CONFIG_FILE="ip_manager.conf"
+# Dit script leest een subnet op basis van de eerste regel van het bestand "ip_db" zoals 10.24.43.0/24. 
+# de regels die daarna volgen in het bestand zijn ip-adressen die al in gebruik zijn. 
+# Als het script gestart wordt met het argument "give", moet het script een IP-adres teruggeven 
+# die nog niet in de lijst staat maar wel binnen het subnet valt. 
+# Als het script gestart wordt met het argument "remove <IP-adres>", moet het script de regel 
+# verwijderen uit het bestand.
+
+set -euo pipefail
+
 DB_FILE="ip_db"
 
-# Function to initialize the IP address database if it doesn't exist.
-init_ip_db() {
-  if [ ! -f "$DB_FILE" ]; then
-    echo "Initializing IP address database..."
-    touch "$DB_FILE"
-  fi
+usage() {
+    echo "Gebruik:"
+    echo "  $0 give"
+    echo "  $0 remove <IP-adres>"
+    exit 1
 }
 
-# Function to get the subnet from the configuration file.
-get_subnet() {
-  subnet=$(grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' "$CONFIG_FILE" | cut -d '/' -f 1)
-  echo "$subnet"
+ip_to_int() {
+    IFS=. read -r a b c d <<< "$1"
+    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
 }
 
-# Function to generate the next available IP address.
-get_next_ip() {
-  subnet=$(get_subnet)
-  used_ips=($(grep -E '^[0-9]{1,3}\.){3}[0-9]{1,3}$' "$DB_FILE"))
-  
-  # Generate a list of all possible IPs in the subnet.
-  ip_range=($(ipcalc $subnet | grep "Network" | cut -d ':' -f 2- | tr ',' '\n'))
-  
-  for ip in "${ip_range[@]}"; do
-    if [[ ! " ${used_ips[*]} " =~ " ${ip} " ]]; then
-      echo "$ip"
-      return
-    fi
-  done
-
-  echo "No available IP addresses in the subnet."
+int_to_ip() {
+    local ip=$1
+    echo "$(( (ip>>24)&255 )).$(( (ip>>16)&255 )).$(( (ip>>8)&255 )).$(( ip&255 ))"
 }
 
-# Function to handle the 'give' command.
+get_subnet_bounds() {
+    local cidr=$1
+    IFS=/ read -r net prefix <<< "$cidr"
+
+    local net_int
+    net_int=$(ip_to_int "$net")
+
+    local mask=$(( 0xFFFFFFFF << (32-prefix) & 0xFFFFFFFF ))
+    local start=$(( net_int & mask ))
+    local end=$(( start | (~mask & 0xFFFFFFFF) ))
+
+    echo "$start $end $prefix"
+}
+
+ip_used() {
+    local ip=$1
+    grep -qx "$ip" "$DB_FILE" && return 0 || return 1
+}
+
 give_ip() {
-  next_ip=$(get_next_ip)
-  
-  if [[ "$next_ip" != *"IP address"* ]]; then
-    echo "Giving IP address: $next_ip"
-    echo "$next_ip" >> "$DB_FILE"
-  fi
+    mapfile -t lines < "$DB_FILE"
+    cidr="${lines[0]}"
+
+    read -r start end prefix <<< "$(get_subnet_bounds "$cidr")"
+
+    # skip network/broadcast
+    if (( prefix <= 30 )); then
+        start=$((start+1))
+        end=$((end-1))
+    fi
+
+    for ((i=start;i<=end;i++)); do
+        ip=$(int_to_ip "$i")
+        if ! ip_used "$ip"; then
+            echo "$ip" >> "$DB_FILE"
+            echo "$ip"
+            exit 0
+        fi
+    done
+
+    echo "Geen vrije IP-adressen beschikbaar" >&2
+    exit 1
 }
 
-# Function to handle the 'remove' command.
 remove_ip() {
-  ip_to_remove=$1
+    ip=$1
+    tmp=$(mktemp)
 
-  if grep -q "^$ip_to_remove$" "$DB_FILE"; then
-    echo "Removing IP address: $ip_to_remove"
-    sed -i "/^$ip_to_remove$/d" "$DB_FILE"
-  else
-    echo "IP address not found in database."
-  fi
+    head -n1 "$DB_FILE" > "$tmp"
+    tail -n +2 "$DB_FILE" | grep -vx "$ip" >> "$tmp"
+
+    mv "$tmp" "$DB_FILE"
 }
 
-# Main function to handle script arguments.
-main() {
-  init_ip_db
+[[ $# -ge 1 ]] || usage
 
-  case "$1" in
+case "$1" in
     give)
-      give_ip
-      ;;
+        give_ip
+        ;;
     remove)
-      if [ -n "$2" ]; then
+        [[ $# -eq 2 ]] || usage
         remove_ip "$2"
-      else
-        echo "Usage: $0 remove <IP address>"
-      fi
-      ;;
+        ;;
     *)
-      echo "Usage: $0 {give|remove <IP address>}"
-      ;;
-  esac
-}
-
-# Execute the main function with script arguments.
-main "$@"
-
-# End of script: src/ip_manager.sh
+        usage
+        ;;
+esac
