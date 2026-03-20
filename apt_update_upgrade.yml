@@ -1,18 +1,93 @@
 ---
-- name: Update en upgrade APT packages
-  hosts: servers
-  become: yes
-
+- name: Lees IP's uit ip_db en bepaal welke nodes online zijn
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ip_db_file: "./ip_db"
+    ssh_user: "root"
+    ssh_password: "{{ lookup('file', lookup('env', 'HOME') + '/secrets/pwd_secret') | trim }}"
   tasks:
-    - name: Update apt cache
-      ansible.builtin.apt:
-        update_cache: yes
-        cache_valid_time: 3600
+    - name: Lees ip_db
+      ansible.builtin.slurp:
+        src: "{{ ip_db_file }}"
+      register: ip_db_raw
 
-    - name: Upgrade packages
+    - name: Maak lijst van IP-adressen vanaf regel 3
+      ansible.builtin.set_fact:
+        target_ips: >-
+          {{
+            (ip_db_raw.content | b64decode).splitlines()[2:]
+            | map('trim')
+            | reject('equalto', '')
+            | list
+          }}
+
+    - name: Toon melding als er geen IP-adressen zijn gevonden
+      ansible.builtin.debug:
+        msg: "WAARSCHUWING: Geen IP-adressen gevonden in {{ ip_db_file }} vanaf regel 2."
+      when: target_ips | length == 0
+
+    - name: Ping elke node met 2 seconden timeout
+      ansible.builtin.command:
+        argv:
+          - ping
+          - -c
+          - "1"
+          - -W
+          - "2"
+          - "{{ item }}"
+      register: ping_results
+      changed_when: false
+      failed_when: false
+      loop: "{{ target_ips }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Voeg online nodes toe aan tijdelijke groep
+      ansible.builtin.add_host:
+        name: "{{ item.item }}"
+        groups: online_nodes
+        ansible_host: "{{ item.item }}"
+        ansible_user: "{{ ssh_user }}"
+        ansible_password: "{{ ssh_password }}"
+        ansible_connection: ssh
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2"
+      loop: "{{ ping_results.results }}"
+      when: item.rc == 0
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Meld offline nodes zonder de play te laten falen
+      ansible.builtin.debug:
+        msg: "WAARSCHUWING: Node {{ item.item }} is offline of reageert niet binnen 2 seconden; wordt overgeslagen."
+      loop: "{{ ping_results.results }}"
+      when: item.rc != 0
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Bewaar lijst van online nodes
+      ansible.builtin.set_fact:
+        online_nodes_list: >-
+          {{
+            ping_results.results
+            | selectattr('rc', 'equalto', 0)
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Toon samenvatting online nodes
+      ansible.builtin.debug:
+        msg: "Online nodes: {{ online_nodes_list | join(', ') if online_nodes_list | length > 0 else 'geen' }}"
+
+- name: Voer apt update en apt upgrade parallel uit op online nodes
+  hosts: online_nodes
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Update apt-cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Upgrade alle pakketten
       ansible.builtin.apt:
         upgrade: dist
-
-    - name: Remove unused packages
-      ansible.builtin.apt:
-        autoremove: yes
