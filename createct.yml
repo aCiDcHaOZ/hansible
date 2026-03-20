@@ -18,11 +18,12 @@
     proxmox_api_token_id: "{{ lookup('ansible.builtin.ini', 'api_token_id type=properties file=' + proxmox_secret_file) | trim }}"
     proxmox_api_token_secret: "{{ lookup('ansible.builtin.ini', 'api_token_secret type=properties file=' + proxmox_secret_file) | trim }}"
 
-    ct_template: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+    proxmox_node: "roos"
+    ct_source_template_vmid: 200
+    ct_clone_type: "linked"
 
     ct_memory: 512
     ct_cores: 1
-    ct_disk: "local-lvm:10"
     ct_bridge: "vmbr0"
     ct_gateway: "10.24.43.1"
     ct_cidr: "24"
@@ -63,6 +64,16 @@
           - groups['servers'] | length > 0
         fail_msg: "De inventorygroep [servers] ontbreekt of bevat geen hosts"
 
+    - name: Controleer dat node roos in inventorygroep servers bestaat
+      ansible.builtin.assert:
+        that:
+          - proxmox_node in groups['servers']
+        fail_msg: "Node {{ proxmox_node }} staat niet in inventorygroep [servers]"
+
+    - name: Stel Proxmox hostgegevens vast voor node roos
+      ansible.builtin.set_fact:
+        proxmox_api_host: "{{ hostvars[proxmox_node].ansible_host | default(proxmox_node) }}"
+
     - name: Controleer dat Netdata API key aanwezig is
       ansible.builtin.assert:
         that:
@@ -70,14 +81,19 @@
           - netdata_stream_api_key | length > 0
         fail_msg: "Bestand ~/secrets/netdata_secret ontbreekt of bevat geen geldige Netdata API key"
 
-    - name: Kies willekeurige PVE-host
-      ansible.builtin.set_fact:
-        selected_pve_host: "{{ groups['servers'] | random }}"
+    - name: Controleer dat bron-template CT 200 bestaat op roos
+      community.proxmox.proxmox_vm_info:
+        node: "{{ proxmox_node }}"
+        vmid: "{{ ct_source_template_vmid }}"
+        type: lxc
+      register: source_ct_info
 
-    - name: Stel Proxmox hostgegevens vast
-      ansible.builtin.set_fact:
-        proxmox_node: "{{ selected_pve_host }}"
-        proxmox_api_host: "{{ hostvars[selected_pve_host].ansible_host | default(selected_pve_host) }}"
+    - name: Controleer dat bron-template CT 200 gevonden is
+      ansible.builtin.assert:
+        that:
+          - source_ct_info.proxmox_vms is defined
+          - source_ct_info.proxmox_vms | length > 0
+        fail_msg: "Bron-template CT {{ ct_source_template_vmid }} is niet gevonden op node {{ proxmox_node }}"
 
     - name: Vraag een vrij IP-adres op
       ansible.builtin.command: "./ip_manager.sh give"
@@ -124,21 +140,26 @@
   tasks:
     - name: Maak CT aan en bootstrap root SSH
       block:
-        - name: Maak de CT aan
+        - name: Clone CT vanaf selfmade template CTID 200 op roos
           community.proxmox.proxmox:
             node: "{{ proxmox_node }}"
             vmid: "{{ ct_vmid }}"
             state: present
+            clone: "{{ ct_source_template_vmid }}"
+            clone_type: "{{ ct_clone_type }}"
             hostname: "{{ ct_hostname }}"
-            ostemplate: "{{ ct_template }}"
-            password: "{{ lookup('ansible.builtin.file', local_home + '/secrets/pwd_secret') | trim }}"
+
+        - name: Pas CT-configuratie aan na clone
+          community.proxmox.proxmox:
+            node: "{{ proxmox_node }}"
+            vmid: "{{ ct_vmid }}"
+            update: true
+            hostname: "{{ ct_hostname }}"
             cores: "{{ ct_cores }}"
             memory: "{{ ct_memory }}"
-            disk: "{{ ct_disk }}"
             netif:
               net0: "name=eth0,bridge={{ ct_bridge }},ip={{ ct_ip_address }}/{{ ct_cidr }},gw={{ ct_gateway }},firewall=1,rate=50"
             onboot: true
-            unprivileged: true
 
         - name: Voeg firewallregels toe aan de CT
           community.proxmox.proxmox_firewall:
@@ -178,11 +199,11 @@
                 enable: true
                 comment: "Drop all other ingress"
 
-        - name: Start de CT
-          community.proxmox.proxmox:
-            node: "{{ proxmox_node }}"
-            vmid: "{{ ct_vmid }}"
-            state: started
+        - name: Start de CT via pct op de Proxmox node
+          ansible.builtin.shell: |
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }} "pct start {{ ct_vmid }}"
+          args:
+            executable: /bin/bash
 
         - name: Wacht kort zodat de CT volledig is opgestart
           ansible.builtin.pause:
@@ -202,11 +223,12 @@
           no_log: true
 
       rescue:
-        - name: Stop de CT als die bestaat
-          community.proxmox.proxmox:
-            node: "{{ proxmox_node }}"
-            vmid: "{{ ct_vmid }}"
-            state: stopped
+        - name: Stop de CT als die bestaat via pct op de Proxmox node
+          ansible.builtin.shell: |
+            ssh -o StrictHostKeyChecking=no root@{{ proxmox_api_host }} \
+            "pct shutdown {{ ct_vmid }} --timeout 20 || pct stop {{ ct_vmid }}"
+          args:
+            executable: /bin/bash
           ignore_errors: true
 
         - name: Verwijder half aangemaakte CT
@@ -264,6 +286,8 @@
     - ansible.posix
 
   vars:
+    proxmox_node: "roos"
+    ct_source_template_vmid: 200
     netdata_parent_ip: "10.24.43.6"
     netdata_parent_port: "19999"
     local_home: "{{ lookup('ansible.builtin.env', 'HOME') }}"
@@ -390,6 +414,12 @@
       ansible.builtin.debug:
         msg: |
           Provisioning van {{ hostvars['localhost'].ct_hostname }} is voltooid.
+
+          Node:
+          {{ proxmox_node }}
+
+          Bron-template:
+          CT {{ ct_source_template_vmid }}
 
           Inloggen als gebruiker:
           {{ ct_username }}
