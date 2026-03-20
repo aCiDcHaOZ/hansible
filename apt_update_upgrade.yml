@@ -12,11 +12,11 @@
         src: "{{ ip_db_file }}"
       register: ip_db_raw
 
-    - name: Maak lijst van IP-adressen vanaf regel 3
+    - name: Maak lijst van IP-adressen vanaf regel 4
       ansible.builtin.set_fact:
         target_ips: >-
           {{
-            (ip_db_raw.content | b64decode).splitlines()[2:]
+            (ip_db_raw.content | b64decode).splitlines()[3:]
             | map('trim')
             | reject('equalto', '')
             | list
